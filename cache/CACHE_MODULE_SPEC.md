@@ -30,6 +30,8 @@ The cache module provides a shared Redis-backed caching abstraction for all serv
 - Provide cache-aside read flow through `GetOrSet`.
 - Provide optional stampede protection lock for `GetOrSet` misses.
 - Provide Redis health check via `Ping`.
+- Provide baseline metrics for cache operability.
+- Support TTL jitter to reduce synchronized expiry bursts.
 
 ### 1.4 Non-Functional Requirements
 - All module errors must follow `apperror` conventions.
@@ -57,7 +59,6 @@ The cache module provides a shared Redis-backed caching abstraction for all serv
 5. `codec.go`: codec interface
 6. `json_codec.go`: default JSON codec
 7. `errors.go`: cache-level error helpers
-8. `noop.go`: no-op fallback cache
 - `cache/redis/`
 1. `redis.go`: Redis cache implementation
 2. `client.go`: mode-aware Redis client creation
@@ -66,7 +67,8 @@ The cache module provides a shared Redis-backed caching abstraction for all serv
 
 ### 2.2 Key Model and Generation
 Input key (service-level):
-- `Domain`, `Entity`, `ID`, `Version` are mandatory.
+- `Domain`, `Entity`, `ID` are mandatory.
+- `Version` is optional (defaults to `v1` when omitted/empty).
 - `Qualifiers` is optional.
 
 Generated key format:
@@ -74,6 +76,8 @@ Generated key format:
 
 Example:
 - Input: `{Domain:user, Entity:profile, ID:123, Version:v1}`
+- Output: `user-service:user:profile:123:v1`
+- Input without version: `{Domain:user, Entity:profile, ID:123}`
 - Output: `user-service:user:profile:123:v1`
 
 Normalization rules:
@@ -83,6 +87,7 @@ Normalization rules:
 - replace spaces with `-`
 - reject empty required fields after normalization
 - reject values containing internal `:` for required fields and qualifiers
+- reject values containing `__` for required fields and qualifiers (reserved internal namespace guard)
 - allowed characters per segment: `a-z`, `0-9`, `.`, `_`, `-`
 
 ### 2.3 Data Flow Design
@@ -98,6 +103,7 @@ Normalization rules:
 3. Resolve TTL:
 - use method TTL if `>0`
 - else use `Config.DefaultTTL`
+4. Apply TTL jitter when enabled (after TTL resolution, before Redis `SET`).
 4. Execute Redis `SET key value ttl`.
 
 #### GetOrSet Flow
@@ -117,9 +123,16 @@ Loader-to-destination rule:
 - The module serializes loader output with configured codec and deserializes into `dest`.
 - `dest` must be a non-nil writable pointer target.
 
+TTL rule:
+- `GetOrSet` uses the same TTL resolution as `Set`:
+1. method TTL wins when `ttl > 0`
+2. otherwise use `Config.DefaultTTL`
+3. if effective TTL `<= 0`, return `CodeInvalidInput`
+
 ### 2.4 Stampede Protection Design
 - Lock key shape:
-`<prefix>:lock:cache:<original-key-suffix>`
+`<prefix>:__cache_lock__:<original-key-suffix>`
+- `__cache_lock__` namespace is reserved for internal module use and must not be used by service business keys.
 - Acquire uses `SET NX PX` semantics via `SetNX` with TTL.
 - Lock token uses unique UUID.
 - Release uses Lua compare-and-delete for ownership-safe unlock.
@@ -138,6 +151,11 @@ Default lock tuning (if unset):
 - `LockWaitTimeout = 2s`
 - `LockRetryInterval = 100ms`
 
+Lock safety contract:
+- `LockTTL` must exceed the expected loader timeout.
+- Loader execution must run with a bounded context timeout shorter than `LockTTL`.
+- Recommended: keep safety margin between loader timeout and `LockTTL` (for example 20-30%).
+
 ### 2.5 Error and Logging Design
 Error mapping:
 - invalid config/key -> `apperror.CodeInvalidInput`
@@ -155,6 +173,18 @@ Graceful degradation contract (`GetOrSet`):
 - Lock acquire failure: log warn and fallback to loader.
 - Lock wait timeout: fallback to loader (current default behavior).
 - Cache `Set` failure after successful loader: log warn and still return loaded value (DB/source remains truth).
+
+### 2.6 Baseline Metrics
+The module should emit minimum metrics in Phase 1:
+- `cache_hit_total`
+- `cache_miss_total`
+- `cache_error_total`
+- basic latency for:
+1. `Get`
+2. `Set`
+3. loader execution in `GetOrSet`
+
+Metric labels should remain minimal in Phase 1 (`operation`, `result`, `service`).
 
 ---
 
@@ -188,6 +218,8 @@ type Config struct {
     KeyPrefix   string
 
     DefaultTTL time.Duration
+    EnableTTLJitter bool
+    TTLJitterPct    float64 // for example 0.10 => +/-10% jitter, valid range [0.0, 0.5]
 
     EnableStampedeProtection bool
     LockTTL                  time.Duration
@@ -265,6 +297,7 @@ func ValidateKey(key Key) error
 1. if `ttl > 0`, use `ttl`
 2. else use `DefaultTTL`
 3. if resolved TTL `<= 0`, return `CodeInvalidInput`
+4. if TTL jitter is enabled, apply jitter before write
 - Output:
 1. `nil` on success
 2. `CodeInternal` on serialize/redis failure
@@ -282,6 +315,7 @@ func ValidateKey(key Key) error
 - Loader called only on miss or fallback conditions.
 - If loader succeeds, module tries to cache value and returns loader result even when cache set fails.
 - Loader failure returns `CodeInternal` wrapping loader cause.
+- TTL handling is identical to `Set` (same resolution and validation rules).
 
 #### `Close() error`
 - Closes underlying Redis client.
@@ -319,6 +353,20 @@ Health-check interface note:
 1. `Set` uses method TTL when `ttl > 0`.
 2. Otherwise uses `DefaultTTL`.
 3. If effective TTL is not positive, return `CodeInvalidInput`.
+4. `GetOrSet` follows the exact same TTL rules.
+- TTL ownership:
+1. The library enforces TTL mechanics and validation.
+2. Service teams own the business TTL decision per data type/use case.
+- Non-expiring keys:
+1. Currently does not allow immortal cache entries.
+2. If effective TTL is not positive, write must fail with `CodeInvalidInput`.
+- TTL jitter:
+1. Optional.
+2. Applies only after effective TTL is resolved.
+3. Should keep TTL positive after jitter.
+4. `TTLJitterPct` valid range: `0.0 <= TTLJitterPct <= 0.5`.
+5. Effective TTL should be calculated as: `effectiveTTL * (1 ± random*jitterPct)`.
+6. Final jittered TTL must be clamped to a positive duration.
 - Timeout defaults (when unset):
 1. `DialTimeout = 2s`
 2. `ReadTimeout = 500ms`
@@ -412,20 +460,21 @@ if err := c.Delete(ctx, key); err != nil {
 - Enable stampede protection for hot keys/high concurrency reads.
 - Avoid using cache as source of truth.
 - Treat Redis outages as degraded performance where business permits.
+- Keep TTL jitter enabled for high-cardinality/hot domains to reduce synchronized expirations.
+- Redis deployment must remain private/internal network only in current phase.
+- Redis must not be directly reachable from public internet/external networks.
 
 ---
 
 ## 5. Future Scope
 
 ### 5.1 Observability Enhancements
-- Define a standard cache metrics contract:
+- Expand baseline metrics into a richer observability contract:
 1. `cache_get_total`
-2. `cache_hit_total`
-3. `cache_miss_total`
-4. `cache_set_total`
-5. `cache_delete_total`
-6. `cache_error_total`
-7. latency histograms for `get`, `set`, and `loader`
+2. `cache_set_total`
+3. `cache_delete_total`
+4. per-operation latency histograms with finer buckets
+5. lock-acquire/lock-timeout counters for stampede analysis
 - Add tracing hooks for cache spans and loader spans.
 
 ### 5.2 Resilience and Fallback Controls
@@ -438,20 +487,26 @@ if err := c.Delete(ctx, key); err != nil {
 - Support pluggable codecs beyond JSON (for example MsgPack/Protobuf).
 - Add optional payload compression for large cache values.
 - Add optional encryption for sensitive cache payloads.
+- Add Redis TLS transport support for in-transit encryption and stronger network security.
 
 ### 5.4 TTL Strategy Improvements
-- Add TTL jitter to avoid synchronized expiration bursts.
 - Add policy-driven TTL profiles by data category (profile/config/search/aggregate).
 
-### 5.5 Invalidation and Key Management
+### 5.5 Negative Caching (Future)
+- Add optional negative caching policy for `NOT_FOUND` loader results.
+- Support short configurable TTL for negative entries.
+- Keep feature opt-in and scoped to explicitly allowed domains/entities.
+- Ensure negative cache entries are distinguishable from normal cached payloads.
+
+### 5.6 Invalidation and Key Management
 - Add first-class support for batch/group invalidation patterns.
 - Define event-driven invalidation integration patterns for write-heavy domains.
 
-### 5.6 Operational and Compliance Guidance
+### 5.7 Operational and Compliance Guidance
 - Add service integration checklist for rollout readiness.
 - Add conformance test guidelines to validate service-side usage against this spec.
 
-### 5.7 Advanced Redis Operations (Optional)
+### 5.8 Advanced Redis Operations (Optional)
 - Add bulk APIs for high-throughput paths:
 1. `MGet(ctx, keys...)`
 2. `MSet(ctx, items, ttl)` (or equivalent batch set contract)
