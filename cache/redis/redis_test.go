@@ -114,3 +114,27 @@ func TestWaitForFillReturnsOnContextCancel(t *testing.T) {
 		t.Fatalf("waitForFill should return quickly on cancellation, took %v", time.Since(start))
 	}
 }
+
+func TestGetOrSetRejectsInvalidTTLBeforeLoader(t *testing.T) {
+	c := &Cache{
+		cfg: cache.Config{DefaultTTL: 0},
+	}
+
+	called := false
+	err := c.GetOrSet(
+		context.Background(),
+		cache.Key{},
+		new(any),
+		0,
+		func(context.Context) (any, error) {
+			called = true
+			return map[string]any{"ok": true}, nil
+		},
+	)
+	if apperror.CodeOf(err) != apperror.CodeInvalidInput {
+		t.Fatalf("expected invalid input for effective TTL, got: %v", err)
+	}
+	if called {
+		t.Fatal("loader should not be called when effective TTL is invalid")
+	}
+}

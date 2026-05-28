@@ -104,15 +104,13 @@ func (c *Cache) Set(ctx context.Context, key cache.Key, value any, ttl time.Dura
 		incError()
 		return apperror.Wrap(apperror.CodeInternal, "cache serialization failed", err)
 	}
-	if ttl <= 0 {
-		ttl = c.cfg.DefaultTTL
-	}
-	if ttl <= 0 {
+	effectiveTTL, err := c.resolveEffectiveTTL(ttl)
+	if err != nil {
 		incError()
-		return apperror.New(apperror.CodeInvalidInput, "cache ttl must be positive")
+		return err
 	}
-	ttl = applyTTLJitter(ttl, c.cfg.EnableTTLJitter, c.cfg.TTLJitterPct)
-	if err := c.client.Set(ctx, redisKey, payload, ttl).Err(); err != nil {
+	effectiveTTL = applyTTLJitter(effectiveTTL, c.cfg.EnableTTLJitter, c.cfg.TTLJitterPct)
+	if err := c.client.Set(ctx, redisKey, payload, effectiveTTL).Err(); err != nil {
 		incError()
 		return wrapRedisError("set", err)
 	}
@@ -153,6 +151,10 @@ func (c *Cache) GetOrSet(ctx context.Context, key cache.Key, dest any, ttl time.
 	if loader == nil {
 		incError()
 		return apperror.New(apperror.CodeInvalidInput, "cache loader is required")
+	}
+	if _, err := c.resolveEffectiveTTL(ttl); err != nil {
+		incError()
+		return err
 	}
 
 	redisKey, err := c.builder.Build(key)
@@ -303,6 +305,17 @@ func applyTTLJitter(ttl time.Duration, enabled bool, jitterPct float64) time.Dur
 	return jittered
 }
 
+func (c *Cache) resolveEffectiveTTL(ttl time.Duration) (time.Duration, error) {
+	effective := ttl
+	if effective <= 0 {
+		effective = c.cfg.DefaultTTL
+	}
+	if effective <= 0 {
+		return 0, apperror.New(apperror.CodeInvalidInput, "cache ttl must be positive")
+	}
+	return effective, nil
+}
+
 func newClient(cfg cache.Config) (red.UniversalClient, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
 	case "", "standalone":
@@ -421,12 +434,14 @@ func (c *Cache) waitForFill(ctx context.Context, key string, dest any, started t
 		} else if apperror.CodeOf(err) != apperror.CodeNotFound {
 			return err
 		}
-		timer := time.NewTimer(c.cfg.LockRetryInterval)
+		retryInterval := c.cfg.LockRetryInterval
+		if retryInterval <= 0 {
+			retryInterval = 100 * time.Millisecond
+		}
+		timer := time.NewTimer(retryInterval)
 		select {
 		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
+			timer.Stop()
 			return ctx.Err()
 		case <-timer.C:
 		}
