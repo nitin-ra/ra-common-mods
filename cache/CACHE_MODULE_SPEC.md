@@ -81,6 +81,9 @@ Normalization rules:
 - remove surrounding `:`
 - lowercase
 - replace spaces with `-`
+- reject empty required fields after normalization
+- reject values containing internal `:` for required fields and qualifiers
+- allowed characters per segment: `a-z`, `0-9`, `.`, `_`, `-`
 
 ### 2.3 Data Flow Design
 #### Get Flow
@@ -108,6 +111,11 @@ Normalization rules:
 - try lock acquire
 - if lock acquired: double-check cache, then loader+set, release lock
 - if lock not acquired: retry cache read until timeout, else fallback loader
+
+Loader-to-destination rule:
+- `loader` returns `any` while `GetOrSet` returns only `error`.
+- The module serializes loader output with configured codec and deserializes into `dest`.
+- `dest` must be a non-nil writable pointer target.
 
 ### 2.4 Stampede Protection Design
 - Lock key shape:
@@ -141,6 +149,12 @@ Logging approach:
 - logger source: `logger.Subsystem("cache")`
 - structured fields include: `operation`, `domain`, `entity`, `backend`, `error`, `key_hash`
 - redis failures are logged at warn/error based on path criticality
+
+Graceful degradation contract (`GetOrSet`):
+- Redis `Get` failure: log warn and fallback to loader.
+- Lock acquire failure: log warn and fallback to loader.
+- Lock wait timeout: fallback to loader (current default behavior).
+- Cache `Set` failure after successful loader: log warn and still return loaded value (DB/source remains truth).
 
 ---
 
@@ -227,7 +241,7 @@ type Codec interface {
 
 ```go
 // redis/redis.go
-func New(cfg cache.Config) (*Cache, error)
+func New(cfg cache.Config) (cache.Cache, error)
 ```
 
 ```go
@@ -257,7 +271,8 @@ func ValidateKey(key Key) error
 
 #### `Delete(ctx, keys...) error`
 - No-op if no keys provided.
-- Returns validation error for invalid key.
+- Validates and builds all keys before executing delete.
+- If any key is invalid, returns validation error and performs no delete.
 
 #### `Exists(ctx, key) (bool, error)`
 - Returns `true` if key exists, else `false`.
@@ -275,6 +290,10 @@ func ValidateKey(key Key) error
 - Returns `nil` if backend reachable.
 - Returns `CodeInternal` wrapped Redis error on failure.
 
+Health-check interface note:
+- `Ping` is intentionally not part of the minimal `Cache` interface.
+- Redis implementation satisfies both `cache.Cache` and `cache.HealthChecker`.
+
 ---
 
 ## 4. Integration Spec
@@ -284,6 +303,32 @@ func ValidateKey(key Key) error
 2. Create cache instance once at startup via `redis.New(cfg)`.
 3. Pass around as `cache.Cache` interface.
 4. Close at shutdown.
+
+### 4.1.1 Config Validation and Defaults Contract
+- Mode default:
+1. Empty `Mode` is treated as `standalone`.
+- Address requirements:
+1. `standalone`: at least one address; first address is used.
+2. `sentinel`: one or more sentinel addresses and `MasterName` required.
+3. `cluster`: one or more node addresses required.
+- Prefix precedence:
+1. If `KeyPrefix` is set, it is used.
+2. Else normalized `ServiceName` is used.
+3. At least one of `KeyPrefix` or `ServiceName` must be non-empty after normalization.
+- TTL behavior:
+1. `Set` uses method TTL when `ttl > 0`.
+2. Otherwise uses `DefaultTTL`.
+3. If effective TTL is not positive, return `CodeInvalidInput`.
+- Timeout defaults (when unset):
+1. `DialTimeout = 2s`
+2. `ReadTimeout = 500ms`
+3. `WriteTimeout = 500ms`
+- Lock defaults (when stampede protection settings are unset):
+1. `LockTTL = 3s`
+2. `LockWaitTimeout = 2s`
+3. `LockRetryInterval = 100ms`
+- Cluster DB rule:
+1. In `cluster` mode, `DB` must be `0`.
 
 ### 4.2 Example Initialization
 
@@ -306,6 +351,12 @@ if err != nil {
     return err
 }
 defer c.Close()
+
+if hc, ok := c.(cache.HealthChecker); ok {
+    if err := hc.Ping(ctx); err != nil {
+        // mark service as degraded or fail readiness based on policy
+    }
+}
 ```
 
 ### 4.3 Example Read Path (`GetOrSet`)
@@ -361,3 +412,56 @@ if err := c.Delete(ctx, key); err != nil {
 - Enable stampede protection for hot keys/high concurrency reads.
 - Avoid using cache as source of truth.
 - Treat Redis outages as degraded performance where business permits.
+
+---
+
+## 5. Future Scope
+
+### 5.1 Observability Enhancements
+- Define a standard cache metrics contract:
+1. `cache_get_total`
+2. `cache_hit_total`
+3. `cache_miss_total`
+4. `cache_set_total`
+5. `cache_delete_total`
+6. `cache_error_total`
+7. latency histograms for `get`, `set`, and `loader`
+- Add tracing hooks for cache spans and loader spans.
+
+### 5.2 Resilience and Fallback Controls
+- Add configurable behavior for lock wait timeout:
+1. strict timeout error
+2. loader fallback (current behavior)
+- Add optional circuit-breaker style protection for repeated Redis failures.
+
+### 5.3 Serialization and Data Handling
+- Support pluggable codecs beyond JSON (for example MsgPack/Protobuf).
+- Add optional payload compression for large cache values.
+- Add optional encryption for sensitive cache payloads.
+
+### 5.4 TTL Strategy Improvements
+- Add TTL jitter to avoid synchronized expiration bursts.
+- Add policy-driven TTL profiles by data category (profile/config/search/aggregate).
+
+### 5.5 Invalidation and Key Management
+- Add first-class support for batch/group invalidation patterns.
+- Define event-driven invalidation integration patterns for write-heavy domains.
+
+### 5.6 Operational and Compliance Guidance
+- Add service integration checklist for rollout readiness.
+- Add conformance test guidelines to validate service-side usage against this spec.
+
+### 5.7 Advanced Redis Operations (Optional)
+- Add bulk APIs for high-throughput paths:
+1. `MGet(ctx, keys...)`
+2. `MSet(ctx, items, ttl)` (or equivalent batch set contract)
+- Add counter APIs for quota/rate/statistics use cases:
+1. `Incr(ctx, key)`
+2. `IncrBy(ctx, key, delta)`
+3. `Decr(ctx, key)`
+4. `DecrBy(ctx, key, delta)`
+- Add hash APIs for partial object operations:
+1. `HGet(ctx, key, field)`
+2. `HSet(ctx, key, fieldValues...)`
+3. `HMGet(ctx, key, fields...)`
+- Keep these capabilities as optional sub-interfaces so core cache consumers can continue using the minimal `Cache` interface.
