@@ -80,6 +80,16 @@ func TestBuildDSN_SpecialCharacters(t *testing.T) {
 			sslmode:          "disable",
 			expectedPassword: "secret",
 		},
+		{
+			name:             "Empty password without trailing colon",
+			username:         "nopassuser",
+			password:         "",
+			host:             "localhost",
+			port:             5432,
+			database:         "testdb",
+			sslmode:          "disable",
+			expectedPassword: "",
+		},
 	}
 
 	for _, tc := range testCases {

@@ -207,6 +207,10 @@ func (db *Database) RunMigrationsWithOptions(ctx context.Context, fsys fs.FS, di
 			if storedChecksum != "" && storedChecksum != fileChecksum {
 				return apperror.New(apperror.CodeConflict, fmt.Sprintf("migration %q was modified after being applied (stored checksum: %s, file checksum: %s)", version, storedChecksum, fileChecksum))
 			}
+			if storedChecksum == "" {
+				updateSQL := fmt.Sprintf("UPDATE %s SET checksum = $1 WHERE version = $2", tableName)
+				_, _ = conn.Exec(ctx, updateSQL, fileChecksum, version)
+			}
 			continue
 		}
 
@@ -322,15 +326,15 @@ func (db *Database) RollbackWithOptions(ctx context.Context, fsys fs.FS, dir str
 	checkTableSQL := `
 		SELECT EXISTS (
 			SELECT 1 FROM information_schema.tables 
-			WHERE table_name = $1 AND table_schema = current_schema()
+			WHERE table_name = lower($1) AND table_schema = current_schema()
 		);
 	`
 	if err := conn.QueryRow(ctx, checkTableSQL, tableName).Scan(&tableExists); err != nil || !tableExists {
 		return apperror.New(apperror.CodeNotFound, fmt.Sprintf("migration history table %q does not exist; cannot perform rollback", tableName))
 	}
 
-	// Query applied migrations in reverse chronological order
-	querySQL := fmt.Sprintf(`SELECT version FROM %s ORDER BY applied_at DESC, version DESC LIMIT $1`, tableName)
+	// Query applied migrations in reverse of the defined migration order
+	querySQL := fmt.Sprintf(`SELECT version FROM %s ORDER BY version DESC LIMIT $1`, tableName)
 	rows, err := conn.Query(ctx, querySQL, steps)
 	if err != nil {
 		return apperror.Wrap(apperror.CodeInternal, fmt.Sprintf("failed to query applied schema migrations from %s", tableName), err)
@@ -358,6 +362,9 @@ func (db *Database) RollbackWithOptions(ctx context.Context, fsys fs.FS, dir str
 
 		content, err := fs.ReadFile(fsys, downPath)
 		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) || os.IsNotExist(err) {
+				return apperror.New(apperror.CodeNotFound, fmt.Sprintf("rollback migration file %q for version %q does not exist", downFile, version))
+			}
 			return apperror.Wrap(apperror.CodeInternal, fmt.Sprintf("failed to read rollback file %s", downFile), err)
 		}
 

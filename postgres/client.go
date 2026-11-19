@@ -36,11 +36,7 @@ func Connect(ctx context.Context, cfg Config, log *slog.Logger) (*Database, erro
 		poolConfig.MaxConns = 25
 	}
 
-	if cfg.MinConns > 0 {
-		poolConfig.MinConns = cfg.MinConns
-	} else {
-		poolConfig.MinConns = 2
-	}
+	poolConfig.MinConns = cfg.MinConns
 
 	if cfg.MaxConnLifetime > 0 {
 		poolConfig.MaxConnLifetime = cfg.MaxConnLifetime

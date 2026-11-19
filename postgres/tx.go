@@ -14,7 +14,7 @@ type txContextKey struct {
 	db *Database
 }
 
-type activeTxOwnerKey struct{}
+type activeTxDatabasesKey struct{}
 
 // ContextWithTx injects an active pgx.Tx transaction handle associated with db into the context.
 func ContextWithTx(ctx context.Context, db *Database, tx pgx.Tx) context.Context {
@@ -22,7 +22,18 @@ func ContextWithTx(ctx context.Context, db *Database, tx pgx.Tx) context.Context
 		return ctx
 	}
 	ctx = context.WithValue(ctx, txContextKey{db: db}, tx)
-	return context.WithValue(ctx, activeTxOwnerKey{}, db)
+
+	var activeDBs map[*Database]struct{}
+	if existing, ok := ctx.Value(activeTxDatabasesKey{}).(map[*Database]struct{}); ok {
+		activeDBs = make(map[*Database]struct{}, len(existing)+1)
+		for k, v := range existing {
+			activeDBs[k] = v
+		}
+	} else {
+		activeDBs = make(map[*Database]struct{}, 1)
+	}
+	activeDBs[db] = struct{}{}
+	return context.WithValue(ctx, activeTxDatabasesKey{}, activeDBs)
 }
 
 // TxFromContext retrieves an active pgx.Tx transaction handle from context associated with this database instance.
@@ -37,8 +48,8 @@ func (db *Database) TxFromContext(ctx context.Context) (pgx.Tx, bool) {
 
 // DB returns the active pgx.Tx from ctx if one is present for this database instance;
 // otherwise it returns db.Pool.
-// If the context contains an active transaction belonging to a DIFFERENT database instance,
-// it returns an explicit error to prevent accidental cross-database query execution.
+// If the context contains active transactions belonging to other database instances, but none for db,
+// it returns an explicit error to prevent accidental cross-database or non-transactional fallback execution.
 func (db *Database) DB(ctx context.Context) (DBTX, error) {
 	if db == nil {
 		return nil, apperror.New(apperror.CodeInternal, "database instance is nil")
@@ -48,10 +59,14 @@ func (db *Database) DB(ctx context.Context) (DBTX, error) {
 		return tx, nil
 	}
 
-	// Guard against cross-database transaction contamination
+	// Guard against cross-database transaction contamination:
+	// If ctx contains active transactions for other database instances, but none for db,
+	// reject to prevent accidental non-transactional fallback on this pool.
 	if ctx != nil {
-		if activeOwner, ok := ctx.Value(activeTxOwnerKey{}).(*Database); ok && activeOwner != nil && activeOwner != db {
-			return nil, apperror.New(apperror.CodeConflict, "context contains a transaction belonging to a different database instance")
+		if activeDBs, ok := ctx.Value(activeTxDatabasesKey{}).(map[*Database]struct{}); ok && len(activeDBs) > 0 {
+			if _, hasSelf := activeDBs[db]; !hasSelf {
+				return nil, apperror.New(apperror.CodeConflict, "context contains a transaction belonging to a different database instance")
+			}
 		}
 	}
 
@@ -86,8 +101,13 @@ func (db *Database) WithTxOptions(ctx context.Context, opts pgx.TxOptions, fn fu
 		if p := recover(); p != nil {
 			// Detached context ensures rollback succeeds even if ctx was cancelled
 			rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = tx.Rollback(rollbackCtx)
+			rbErr := tx.Rollback(rollbackCtx)
 			cancel()
+			if rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+				if db.log != nil {
+					db.log.ErrorContext(context.Background(), "failed to rollback transaction during panic", "error", rbErr)
+				}
+			}
 			panic(p) // Re-throw panic after rollback to preserve caller diagnostics
 		} else if err != nil {
 			rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -97,10 +117,14 @@ func (db *Database) WithTxOptions(ctx context.Context, opts pgx.TxOptions, fn fu
 				if db.log != nil {
 					db.log.ErrorContext(ctx, "failed to rollback transaction", "error", rbErr)
 				}
+				err = errors.Join(err, apperror.Wrap(apperror.CodeInternal, "failed to rollback transaction", rbErr))
 			}
 		} else {
 			if commitErr := tx.Commit(ctx); commitErr != nil {
 				err = apperror.Wrap(apperror.CodeInternal, "failed to commit database transaction", commitErr)
+				rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = tx.Rollback(rollbackCtx)
+				cancel()
 			}
 		}
 	}()
@@ -111,8 +135,14 @@ func (db *Database) WithTxOptions(ctx context.Context, opts pgx.TxOptions, fn fu
 
 // WithinTx wraps fn in a context-propagated transaction.
 // If an active transaction already exists for this database in ctx, fn directly participates
-// in the existing transaction without creating savepoints or sub-transactions.
-// If the context contains a transaction from a different database instance, an explicit conflict error is returned.
+// in the existing atomic transaction without creating savepoints or sub-transactions.
+//
+// Note on PostgreSQL transaction behavior:
+// Because nested transactions participate directly in the single parent transaction without SAVEPOINTs,
+// any SQL execution error inside fn will leave the underlying PostgreSQL transaction in an aborted state
+// (SQLSTATE 25P02: current transaction is aborted, commands ignored until end of transaction block).
+// Catching or ignoring a Go error from a failed SQL statement will NOT restore the transaction.
+// If any nested operation fails, the transaction must be rolled back by the outer transaction owner.
 func (db *Database) WithinTx(ctx context.Context, fn func(txCtx context.Context) error) error {
 	return db.WithinTxOptions(ctx, pgx.TxOptions{}, fn)
 }
@@ -124,14 +154,7 @@ func (db *Database) WithinTxOptions(ctx context.Context, opts pgx.TxOptions, fn 
 		return apperror.New(apperror.CodeInternal, "database instance is nil")
 	}
 
-	// 1. Guard against cross-database transaction conflict
-	if ctx != nil {
-		if activeOwner, ok := ctx.Value(activeTxOwnerKey{}).(*Database); ok && activeOwner != nil && activeOwner != db {
-			return apperror.New(apperror.CodeConflict, "cannot start transaction: context already has an active transaction for a different database")
-		}
-	}
-
-	// 2. Check if a transaction for this database already exists in ctx
+	// 1. Check if a transaction for this database already exists in ctx
 	if existingTx, ok := db.TxFromContext(ctx); ok && existingTx != nil {
 		// Reject incompatible options attempted on an existing transaction
 		if opts.IsoLevel != "" || opts.AccessMode != "" {
@@ -141,7 +164,7 @@ func (db *Database) WithinTxOptions(ctx context.Context, opts pgx.TxOptions, fn 
 		return fn(ctx)
 	}
 
-	// 3. Start top-level transaction and inject into context
+	// 2. Start top-level transaction for this database and inject into context
 	if db.Pool == nil {
 		return apperror.New(apperror.CodeInternal, "database pool is not initialized")
 	}

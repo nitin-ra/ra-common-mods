@@ -68,8 +68,12 @@ func (cfg Config) Validate() error {
 		return apperror.New(apperror.CodeInvalidInput, "min_conns cannot be negative")
 	}
 
-	if cfg.MaxConns > 0 && cfg.MinConns > cfg.MaxConns {
-		return apperror.New(apperror.CodeInvalidInput, fmt.Sprintf("min_conns (%d) cannot exceed max_conns (%d)", cfg.MinConns, cfg.MaxConns))
+	maxConns := cfg.MaxConns
+	if maxConns == 0 {
+		maxConns = 25
+	}
+	if cfg.MinConns > maxConns {
+		return apperror.New(apperror.CodeInvalidInput, fmt.Sprintf("min_conns (%d) cannot exceed max_conns (%d)", cfg.MinConns, maxConns))
 	}
 
 	if cfg.MaxConnLifetime < 0 {
@@ -103,9 +107,16 @@ func (cfg Config) Validate() error {
 
 // BuildDSN constructs a properly URL-escaped PostgreSQL connection string.
 func BuildDSN(cfg Config) string {
+	var user *url.Userinfo
+	if cfg.Password != "" {
+		user = url.UserPassword(cfg.Username, cfg.Password)
+	} else if cfg.Username != "" {
+		user = url.User(cfg.Username)
+	}
+
 	u := url.URL{
 		Scheme: "postgres",
-		User:   url.UserPassword(cfg.Username, cfg.Password),
+		User:   user,
 		Host:   net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
 		Path:   "/" + strings.TrimPrefix(cfg.Database, "/"),
 	}
@@ -120,9 +131,16 @@ func BuildDSN(cfg Config) string {
 // RedactedDSN constructs a URL-escaped PostgreSQL connection string with password masked.
 // Use this for safe logging and diagnostic outputs.
 func RedactedDSN(cfg Config) string {
+	var user *url.Userinfo
+	if cfg.Password != "" {
+		user = url.UserPassword(cfg.Username, cfg.Password)
+	} else if cfg.Username != "" {
+		user = url.User(cfg.Username)
+	}
+
 	u := url.URL{
 		Scheme: "postgres",
-		User:   url.UserPassword(cfg.Username, cfg.Password),
+		User:   user,
 		Host:   net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
 		Path:   "/" + strings.TrimPrefix(cfg.Database, "/"),
 	}
