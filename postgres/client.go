@@ -1,0 +1,126 @@
+package postgres
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/routerarchitects/ra-common-mods/apperror"
+)
+
+// Database encapsulates the PostgreSQL pgxpool connection pool and logger.
+type Database struct {
+	Pool *pgxpool.Pool
+	log  *slog.Logger
+}
+
+// Connect establishes a connection pool to PostgreSQL and returns a Database wrapper.
+func Connect(ctx context.Context, cfg Config, log *slog.Logger) (*Database, error) {
+	storageType := cfg.StorageType
+	if storageType == "" {
+		storageType = "postgresql"
+	}
+	if !strings.EqualFold(storageType, "postgresql") {
+		return nil, apperror.New(apperror.CodeInternal, fmt.Sprintf("unsupported storage type: %s", storageType))
+	}
+
+	dsn := BuildDSN(cfg)
+
+	poolConfig, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.CodeInternal, "failed to parse postgres dsn config", err)
+	}
+
+	// Apply connection pool sizing and lifetime configurations
+	if cfg.MaxConns > 0 {
+		poolConfig.MaxConns = cfg.MaxConns
+	} else {
+		poolConfig.MaxConns = 25
+	}
+
+	if cfg.MinConns > 0 {
+		poolConfig.MinConns = cfg.MinConns
+	} else {
+		poolConfig.MinConns = 2
+	}
+
+	if cfg.MaxConnLifetime > 0 {
+		poolConfig.MaxConnLifetime = cfg.MaxConnLifetime
+	} else {
+		poolConfig.MaxConnLifetime = 30 * time.Minute
+	}
+
+	if cfg.MaxConnIdleTime > 0 {
+		poolConfig.MaxConnIdleTime = cfg.MaxConnIdleTime
+	} else {
+		poolConfig.MaxConnIdleTime = 10 * time.Minute
+	}
+
+	healthCheckTimeout := cfg.HealthCheckTimeout
+	if healthCheckTimeout <= 0 {
+		healthCheckTimeout = 5 * time.Second
+	}
+
+	if log == nil {
+		log = slog.Default()
+	}
+
+	log.InfoContext(ctx, "connecting to postgresql database",
+		"host", cfg.Host,
+		"port", cfg.Port,
+		"database", cfg.Database,
+		"max_conns", poolConfig.MaxConns,
+		"min_conns", poolConfig.MinConns,
+		"max_conn_lifetime", poolConfig.MaxConnLifetime,
+		"max_conn_idle_time", poolConfig.MaxConnIdleTime,
+	)
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.CodeInternal, "failed to establish postgres connection pool", err)
+	}
+
+	// Verify the connection pool health
+	pingCtx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
+	defer cancel()
+	if err := pool.Ping(pingCtx); err != nil {
+		pool.Close()
+		return nil, apperror.Wrap(apperror.CodeInternal, "failed to ping database", err)
+	}
+
+	log.InfoContext(ctx, "successfully connected to postgresql database")
+
+	return &Database{
+		Pool: pool,
+		log:  log,
+	}, nil
+}
+
+// Ping verifies database connectivity within the provided context.
+func (db *Database) Ping(ctx context.Context) error {
+	if db == nil || db.Pool == nil {
+		return apperror.New(apperror.CodeInternal, "database pool is not initialized")
+	}
+	return db.Pool.Ping(ctx)
+}
+
+// Close closes the connection pool.
+func (db *Database) Close() {
+	if db != nil && db.Pool != nil {
+		if db.log != nil {
+			db.log.Info("closing database connection pool")
+		}
+		db.Pool.Close()
+	}
+}
+
+// Logger returns the associated structured logger.
+func (db *Database) Logger() *slog.Logger {
+	if db == nil || db.log == nil {
+		return slog.Default()
+	}
+	return db.log
+}
