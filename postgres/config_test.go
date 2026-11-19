@@ -104,7 +104,7 @@ func TestBuildDSN_SpecialCharacters(t *testing.T) {
 			}
 
 			dsn := postgres.BuildDSN(cfg)
-			t.Logf("Generated DSN: %s", dsn)
+			t.Logf("Generated DSN (redacted): %s", postgres.RedactedDSN(cfg))
 
 			poolConfig, err := pgxpool.ParseConfig(dsn)
 			if err != nil {
@@ -281,6 +281,51 @@ func TestConfig_Validate(t *testing.T) {
 			errMsg:      "unsupported postgres sslmode",
 		},
 		{
+			name: "Invalid SSLMode none",
+			cfg: postgres.Config{
+				Host:     "localhost",
+				Port:     5432,
+				Username: "postgres",
+				Database: "postgres",
+				SSLMode:  "none",
+			},
+			expectError: true,
+			errMsg:      "unsupported postgres sslmode",
+		},
+		{
+			name: "Valid mixed-case SSLMode DISABLE",
+			cfg: postgres.Config{
+				Host:     "localhost",
+				Port:     5432,
+				Username: "postgres",
+				Database: "postgres",
+				SSLMode:  "DISABLE",
+			},
+			expectError: false,
+		},
+		{
+			name: "Valid mixed-case SSLMode Require",
+			cfg: postgres.Config{
+				Host:     "localhost",
+				Port:     5432,
+				Username: "postgres",
+				Database: "postgres",
+				SSLMode:  "Require",
+			},
+			expectError: false,
+		},
+		{
+			name: "Valid mixed-case SSLMode Verify-Full",
+			cfg: postgres.Config{
+				Host:     "localhost",
+				Port:     5432,
+				Username: "postgres",
+				Database: "postgres",
+				SSLMode:  "Verify-Full",
+			},
+			expectError: false,
+		},
+		{
 			name: "Invalid migrations table identifier",
 			cfg: postgres.Config{
 				Host:            "localhost",
@@ -347,6 +392,9 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	}
 	if cfg.MigrationsTable != "schema_migrations" {
 		t.Errorf("expected default MigrationsTable 'schema_migrations', got %q", cfg.MigrationsTable)
+	}
+	if cfg.SSLMode != "require" {
+		t.Errorf("expected default SSLMode 'require', got %q", cfg.SSLMode)
 	}
 }
 

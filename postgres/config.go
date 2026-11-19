@@ -28,7 +28,7 @@ type Config struct {
 	Username           string        `env:"USERNAME" envDefault:"postgres"`
 	Password           string        `env:"PASSWORD"`
 	Database           string        `env:"DATABASE" envDefault:"postgres"`
-	SSLMode            string        `env:"SSLMODE" envDefault:"disable"`
+	SSLMode            string        `env:"SSLMODE" envDefault:"require"`
 	MaxConns           int32         `env:"MAX_CONNS" envDefault:"25"`
 	MinConns           int32         `env:"MIN_CONNS" envDefault:"2"`
 	MaxConnLifetime    time.Duration `env:"MAX_CONN_LIFETIME" envDefault:"30m"`
@@ -88,13 +88,15 @@ func (cfg Config) Validate() error {
 		return apperror.New(apperror.CodeInvalidInput, "health_check_timeout cannot be negative")
 	}
 
-	if cfg.SSLMode != "" {
-		switch strings.ToLower(cfg.SSLMode) {
-		case "disable", "allow", "prefer", "require", "verify-ca", "verify-full":
-			// Valid SSL modes
-		default:
-			return apperror.New(apperror.CodeInvalidInput, fmt.Sprintf("unsupported postgres sslmode: %q", cfg.SSLMode))
-		}
+	sslMode := strings.ToLower(strings.TrimSpace(cfg.SSLMode))
+	if sslMode == "" {
+		sslMode = "require"
+	}
+	switch sslMode {
+	case "disable", "allow", "prefer", "require", "verify-ca", "verify-full":
+		// Valid SSL modes
+	default:
+		return apperror.New(apperror.CodeInvalidInput, fmt.Sprintf("unsupported postgres sslmode: %q", cfg.SSLMode))
 	}
 
 	tableName := strings.TrimSpace(cfg.MigrationsTable)
@@ -106,6 +108,8 @@ func (cfg Config) Validate() error {
 }
 
 // BuildDSN constructs a properly URL-escaped PostgreSQL connection string.
+// Default SSL mode is "require" to ensure production connections are encrypted.
+// For local development without TLS, explicitly set SSLMode to "disable".
 func BuildDSN(cfg Config) string {
 	var user *url.Userinfo
 	if cfg.Password != "" {
@@ -120,11 +124,15 @@ func BuildDSN(cfg Config) string {
 		Host:   net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
 		Path:   "/" + strings.TrimPrefix(cfg.Database, "/"),
 	}
-	if cfg.SSLMode != "" {
-		q := u.Query()
-		q.Set("sslmode", cfg.SSLMode)
-		u.RawQuery = q.Encode()
+
+	sslMode := strings.ToLower(strings.TrimSpace(cfg.SSLMode))
+	if sslMode == "" {
+		sslMode = "require"
 	}
+	q := u.Query()
+	q.Set("sslmode", sslMode)
+	u.RawQuery = q.Encode()
+
 	return u.String()
 }
 
@@ -144,11 +152,15 @@ func RedactedDSN(cfg Config) string {
 		Host:   net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
 		Path:   "/" + strings.TrimPrefix(cfg.Database, "/"),
 	}
-	if cfg.SSLMode != "" {
-		q := u.Query()
-		q.Set("sslmode", cfg.SSLMode)
-		u.RawQuery = q.Encode()
+
+	sslMode := strings.ToLower(strings.TrimSpace(cfg.SSLMode))
+	if sslMode == "" {
+		sslMode = "require"
 	}
+	q := u.Query()
+	q.Set("sslmode", sslMode)
+	u.RawQuery = q.Encode()
+
 	return u.Redacted()
 }
 

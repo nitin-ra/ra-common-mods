@@ -79,11 +79,9 @@ func TestTx_ContextPropagation_SingleDB(t *testing.T) {
 func TestTx_MultiDatabase_Isolation(t *testing.T) {
 	dbA := &postgres.Database{Pool: nil}
 	dbB := &postgres.Database{Pool: nil}
-	dbC := &postgres.Database{Pool: nil}
 
 	ctx := context.Background()
 	mockA := &mockTx{}
-	mockB := &mockTx{}
 
 	// 1. Transaction started on database A and retrieved through A
 	txCtxA := postgres.ContextWithTx(ctx, dbA, mockA)
@@ -109,36 +107,40 @@ func TestTx_MultiDatabase_Isolation(t *testing.T) {
 		t.Fatalf("expected cross-database error, got: %v", err)
 	}
 
-	// 3. Independent transactions across two databases
-	txCtxAB := postgres.ContextWithTx(txCtxA, dbB, mockB)
-
-	// In txCtxAB, dbA still retrieves mockA
-	txA2, okA := dbA.TxFromContext(txCtxAB)
-	if !okA || txA2 != mockA {
-		t.Fatalf("expected dbA to retrieve mockA in multi-tx context, got ok=%v, tx=%v", okA, txA2)
+	// 3. dbB.WithinTx(txCtxA) must detect cross-database transaction and reject immediately without executing callback
+	callbackExecuted := false
+	err = dbB.WithinTx(txCtxA, func(c context.Context) error {
+		callbackExecuted = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected dbB.WithinTx to reject cross-database tx context, got nil")
 	}
-	dbtxA2, errA := dbA.DB(txCtxAB)
-	if errA != nil || dbtxA2 != mockA {
-		t.Fatalf("expected dbA.DB to return mockA in multi-tx context, got err=%v", errA)
+	if !strings.Contains(err.Error(), "cross-database transaction detected") {
+		t.Fatalf("expected cross-database conflict error, got: %v", err)
 	}
-
-	// In txCtxAB, dbB retrieves mockB
-	txB2, okB := dbB.TxFromContext(txCtxAB)
-	if !okB || txB2 != mockB {
-		t.Fatalf("expected dbB to retrieve mockB in multi-tx context, got ok=%v, tx=%v", okB, txB2)
-	}
-	dbtxB2, errB := dbB.DB(txCtxAB)
-	if errB != nil || dbtxB2 != mockB {
-		t.Fatalf("expected dbB.DB to return mockB in multi-tx context, got err=%v", errB)
+	if callbackExecuted {
+		t.Fatal("expected callback NOT to execute when cross-database transaction is detected")
 	}
 
-	// dbC has no transaction and must reject txCtxAB
-	_, errC := dbC.DB(txCtxAB)
-	if errC == nil || !strings.Contains(errC.Error(), "different database instance") {
-		t.Fatalf("expected dbC.DB to reject multi-tx context, got: %v", errC)
+	// 4. dbA.WithinTx(txCtxA) same-database nesting must succeed
+	sameDBExecuted := false
+	err = dbA.WithinTx(txCtxA, func(nestedCtx context.Context) error {
+		sameDBExecuted = true
+		tx, ok := dbA.TxFromContext(nestedCtx)
+		if !ok || tx != mockA {
+			t.Fatal("nested call failed to receive existing mock tx")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error on same-database nesting: %v", err)
+	}
+	if !sameDBExecuted {
+		t.Fatal("expected same-database nested callback to execute")
 	}
 
-	// 4. Repository operations without active transactions
+	// 5. Repository operations without active transactions
 	cleanCtx := context.Background()
 	txNone, okNone := dbA.TxFromContext(cleanCtx)
 	if okNone || txNone != nil {
@@ -151,15 +153,49 @@ func TestTx_WithinTx_IncompatibleOptionsRejection(t *testing.T) {
 	mock := &mockTx{}
 	txCtx := postgres.ContextWithTx(context.Background(), db, mock)
 
-	// Attempting to apply new isolation level inside existing transaction must fail
-	err := db.WithinTxOptions(txCtx, pgx.TxOptions{IsoLevel: pgx.Serializable}, func(c context.Context) error {
-		return nil
-	})
-	if err == nil {
-		t.Fatal("expected error applying new options to existing tx, got nil")
+	testCases := []struct {
+		name string
+		opts pgx.TxOptions
+	}{
+		{
+			name: "Incompatible IsoLevel",
+			opts: pgx.TxOptions{IsoLevel: pgx.Serializable},
+		},
+		{
+			name: "Incompatible AccessMode",
+			opts: pgx.TxOptions{AccessMode: pgx.ReadOnly},
+		},
+		{
+			name: "Incompatible DeferrableMode",
+			opts: pgx.TxOptions{DeferrableMode: pgx.Deferrable},
+		},
+		{
+			name: "All incompatible options combined",
+			opts: pgx.TxOptions{
+				IsoLevel:       pgx.RepeatableRead,
+				AccessMode:     pgx.ReadOnly,
+				DeferrableMode: pgx.Deferrable,
+			},
+		},
 	}
-	if !strings.Contains(err.Error(), "cannot apply new transaction options to an existing transaction") {
-		t.Fatalf("expected incompatible options error, got: %v", err)
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			executed := false
+			err := db.WithinTxOptions(txCtx, tc.opts, func(c context.Context) error {
+				executed = true
+				return nil
+			})
+			if err == nil {
+				t.Fatalf("expected error applying %s to existing tx, got nil", tc.name)
+			}
+			if !strings.Contains(err.Error(), "cannot apply transaction options") {
+				t.Fatalf("expected descriptive incompatible options error, got: %v", err)
+			}
+			if executed {
+				t.Fatal("expected callback NOT to be executed when incompatible options are provided")
+			}
+		})
 	}
 }
 

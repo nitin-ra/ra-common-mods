@@ -9,10 +9,11 @@ import (
 	"github.com/routerarchitects/ra-common-mods/apperror"
 )
 
-// Database encapsulates the PostgreSQL pgxpool connection pool and logger.
+// Database encapsulates the PostgreSQL pgxpool connection pool, configuration, and logger.
 type Database struct {
 	Pool *pgxpool.Pool
 	log  *slog.Logger
+	cfg  Config
 }
 
 // Connect establishes a connection pool to PostgreSQL and returns a Database wrapper.
@@ -88,6 +89,7 @@ func Connect(ctx context.Context, cfg Config, log *slog.Logger) (*Database, erro
 	return &Database{
 		Pool: pool,
 		log:  log,
+		cfg:  cfg,
 	}, nil
 }
 
@@ -115,4 +117,12 @@ func (db *Database) Logger() *slog.Logger {
 		return slog.Default()
 	}
 	return db.log
+}
+
+// Config returns a copy of the configuration used to establish the database connection.
+func (db *Database) Config() Config {
+	if db == nil {
+		return Config{}
+	}
+	return db.cfg
 }

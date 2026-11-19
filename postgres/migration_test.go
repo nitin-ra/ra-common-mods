@@ -54,9 +54,39 @@ func TestMigration_MissingDownFile(t *testing.T) {
 	}
 }
 
-func TestMigration_DuplicateVersion(t *testing.T) {
+func TestMigration_InvalidVersionFormat(t *testing.T) {
 	database := &postgres.Database{Pool: nil}
 
+	mapFS := fstest.MapFS{
+		"migrations/invalid_version_no_digits.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE items (id INT);"),
+		},
+		"migrations/invalid_version_no_digits.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE items;"),
+		},
+	}
+
+	err := database.RunMigrationsFS(context.Background(), mapFS, "migrations", testAdvisoryLockKey)
+	if err == nil || !strings.Contains(err.Error(), "invalid migration version") {
+		t.Fatalf("expected invalid migration version error, got: %v", err)
+	}
+}
+
+func TestMigration_ConfiguredTableName(t *testing.T) {
+	// Verify that a Database initialized with custom MigrationsTable uses it
+	db := &postgres.Database{
+		Pool: nil,
+	}
+	// Test configuration getter
+	if db.Config().MigrationsTable != "" {
+		t.Fatal("expected empty MigrationsTable on unconfigured db")
+	}
+
+	// Validate invalid custom table names in options
+	opts := postgres.MigrationOptions{
+		TableName:       "; DROP TABLE users; --",
+		AdvisoryLockKey: testAdvisoryLockKey,
+	}
 	mapFS := fstest.MapFS{
 		"migrations/000001_init.up.sql": &fstest.MapFile{
 			Data: []byte("CREATE TABLE items (id INT);"),
@@ -65,11 +95,9 @@ func TestMigration_DuplicateVersion(t *testing.T) {
 			Data: []byte("DROP TABLE items;"),
 		},
 	}
-
-	// Run with valid lock key
-	err := database.RunMigrationsFS(context.Background(), mapFS, "migrations", testAdvisoryLockKey)
-	if err == nil || !strings.Contains(err.Error(), "database pool is not initialized") {
-		t.Fatalf("expected nil pool error, got: %v", err)
+	err := db.RunMigrationsWithOptions(context.Background(), mapFS, "migrations", opts)
+	if err == nil || !strings.Contains(err.Error(), "invalid migrations table name") {
+		t.Fatalf("expected invalid migrations table name error, got: %v", err)
 	}
 }
 

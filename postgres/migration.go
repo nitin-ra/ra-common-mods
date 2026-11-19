@@ -17,12 +17,22 @@ import (
 	"github.com/routerarchitects/ra-common-mods/apperror"
 )
 
-var validTableNameRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+var (
+	validTableNameRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+	validVersionRegex   = regexp.MustCompile(`^[0-9]+[a-zA-Z0-9_-]*$`)
+)
 
 // MigrationOptions configures the execution of database schema migrations.
 type MigrationOptions struct {
-	TableName       string // Table name for tracking migrations (defaults to "schema_migrations")
+	TableName       string // Table name for tracking migrations (defaults to configured or "schema_migrations")
 	AdvisoryLockKey int64  // Required 64-bit advisory lock key to serialize concurrent runs
+}
+
+func (db *Database) migrationTable() string {
+	if db != nil && strings.TrimSpace(db.cfg.MigrationsTable) != "" {
+		return strings.TrimSpace(db.cfg.MigrationsTable)
+	}
+	return "schema_migrations"
 }
 
 func sanitizeTableName(table string) (string, error) {
@@ -43,7 +53,7 @@ func (db *Database) RunMigrations(ctx context.Context, migrationsDir string, adv
 		return apperror.New(apperror.CodeNotFound, fmt.Sprintf("migrations directory %q does not exist", migrationsDir))
 	}
 	return db.RunMigrationsWithOptions(ctx, os.DirFS(migrationsDir), ".", MigrationOptions{
-		TableName:       "schema_migrations",
+		TableName:       db.migrationTable(),
 		AdvisoryLockKey: advisoryLockKey,
 	})
 }
@@ -51,7 +61,7 @@ func (db *Database) RunMigrations(ctx context.Context, migrationsDir string, adv
 // RunMigrationsFS executes forward migrations from an arbitrary fs.FS filesystem (e.g. embed.FS or os.DirFS).
 func (db *Database) RunMigrationsFS(ctx context.Context, fsys fs.FS, dir string, advisoryLockKey int64) error {
 	return db.RunMigrationsWithOptions(ctx, fsys, dir, MigrationOptions{
-		TableName:       "schema_migrations",
+		TableName:       db.migrationTable(),
 		AdvisoryLockKey: advisoryLockKey,
 	})
 }
@@ -84,8 +94,11 @@ func (db *Database) RunMigrationsWithOptions(ctx context.Context, fsys fs.FS, di
 	upFileMap := make(map[string]bool)
 	for _, entry := range entries {
 		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".up.sql") {
-			upFiles = append(upFiles, entry.Name())
 			version := strings.TrimSuffix(entry.Name(), ".up.sql")
+			if !validVersionRegex.MatchString(version) {
+				return apperror.New(apperror.CodeInvalidInput, fmt.Sprintf("invalid migration version %q in file %q: must start with numbers and contain only alphanumeric, underscore, or dash characters", version, entry.Name()))
+			}
+			upFiles = append(upFiles, entry.Name())
 			if upFileMap[version] {
 				return apperror.New(apperror.CodeConflict, fmt.Sprintf("duplicate migration version detected: %s", version))
 			}
@@ -257,7 +270,7 @@ func (db *Database) Rollback(ctx context.Context, migrationsDir string, steps in
 		return apperror.New(apperror.CodeNotFound, fmt.Sprintf("migrations directory %q does not exist", migrationsDir))
 	}
 	return db.RollbackWithOptions(ctx, os.DirFS(migrationsDir), ".", steps, MigrationOptions{
-		TableName:       "schema_migrations",
+		TableName:       db.migrationTable(),
 		AdvisoryLockKey: advisoryLockKey,
 	})
 }
@@ -265,7 +278,7 @@ func (db *Database) Rollback(ctx context.Context, migrationsDir string, steps in
 // RollbackFS reverses the latest applied migrations up to the specified number of steps from an fs.FS filesystem.
 func (db *Database) RollbackFS(ctx context.Context, fsys fs.FS, dir string, steps int, advisoryLockKey int64) error {
 	return db.RollbackWithOptions(ctx, fsys, dir, steps, MigrationOptions{
-		TableName:       "schema_migrations",
+		TableName:       db.migrationTable(),
 		AdvisoryLockKey: advisoryLockKey,
 	})
 }

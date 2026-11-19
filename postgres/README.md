@@ -7,20 +7,24 @@ A production-grade, hardened, lightweight PostgreSQL infrastructure module for G
 ## Features
 
 - **Connection Pool Tuning (`pgxpool`)**: Configurable min/max connections, connection lifetimes, idle timeouts, and health-check ping timeouts via environment variables or typed configuration.
-- **Strict Configuration Validation**: Zero unsafe production defaults. Validates host, port (1–65535), username, database, pool bounds (`MinConns <= MaxConns`), and valid SSL modes. Automatic migrations are disabled by default (`AutoMigrate: false`).
+- **Secure Configuration & SSL Defaults**:
+  - **Secure by Default**: `SSLMODE` defaults to `require` to protect credentials and data from unencrypted transport in production and cloud environments.
+  - **Local Development**: Explicitly set `SSLMODE=disable` when running locally against unencrypted PostgreSQL containers or test databases.
+  - **Strict Validation**: Validates host, port (1–65535), username, database, pool bounds (`MinConns <= MaxConns`), and valid SSL modes (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`). Automatic migrations are disabled by default (`AutoMigrate: false`).
 - **Safe Credential Handling**: Passwords and sensitive parameters are never printed in structured logs or connection errors. Provides `RedactedDSN(cfg)` for safe diagnostic logs.
 - **Transactional Schema Migrations**:
   - Multi-statement SQL script support (parameterless protocol execution).
-  - Cryptographic integrity protection: SHA-256 checksum verification detects tampering of already-applied migrations.
+  - Cryptographic integrity protection: SHA-256 checksum verification detects tampering of already-applied migrations and automatically backfills legacy records with error propagation.
   - Strict forward (`.up.sql`) and rollback (`.down.sql`) pairing.
-  - Namespace isolation: Configurable migration tracking tables (`MigrationOptions.TableName`) to support multiple services/modules sharing a database.
+  - Namespace isolation: Configurable migration tracking tables (`Config.MigrationsTable` and `MigrationOptions.TableName`) to support multiple services/modules sharing a database.
   - Mandatory session-level advisory locking (`pg_advisory_lock`) with non-zero 64-bit key validation.
   - Supports standard filesystem paths (`RunMigrations`) and embedded filesystems (`RunMigrationsFS` via `//go:embed` or `io/fs.FS`).
 - **Hardened Transaction Toolkit**:
   - **Minimal `DBTX` Interface**: Minimal `Exec`, `Query`, `QueryRow` interface for repository implementations, plus optional `ExtendedDBTX` for advanced operations (`CopyFrom`, `SendBatch`).
-  - **`WithTx` / `WithTxOptions`**: Atomic transaction block guaranteeing commit on success, detached-context rollback on error or context cancellation, and rollback before re-throwing panics.
+  - **`WithTx` / `WithTxOptions`**: Atomic transaction block guaranteeing commit on success, detached-context rollback on error or context cancellation, and rollback before re-throwing panics. Rollback errors are preserved and joined via `errors.Join`.
   - **`WithinTx` / `WithinTxOptions`**: Context-propagated transactions. When called within an existing transaction for the same database, it participates directly in the single atomic transaction without SAVEPOINT overhead.
-  - **Multi-Database Isolation**: Transactions are strictly bound to their owning `*Database` instance. `db.DB(ctx)` returns `(DBTX, error)` and explicitly rejects cross-database transaction contamination.
+  - **Single-Database Transaction Scope**: Supports single-database transactions. If a context carries an active transaction for another database, `WithinTx` immediately returns a conflict error. Distributed two-phase commit (2PC) is not supported and can be implemented in a future release if required.
+  - **Cross-Database Transaction Isolation**: Transactions are strictly bound to their owning `*Database` instance. `db.DB(ctx)` returns `(DBTX, error)` and explicitly rejects cross-database transaction contamination.
   - **`WithRetryTx`**: Automatic backoff and retry on PostgreSQL transient concurrency conflicts (`40001: serialization_failure` and `40P01: deadlock_detected`) respecting context cancellation.
   - **Side-Effect Isolation**: Use `db.Pool` directly when writing out-of-band audit events or alerts that should not be rolled back with the main transaction.
 
@@ -52,6 +56,7 @@ func main() {
 	ctx := context.Background()
 
 	// Loads from STORAGE_TYPE_POSTGRESQL_* environment variables
+	// SSLMODE defaults to "require"
 	cfg, err := postgres.DefaultConfig()
 	if err != nil {
 		panic(err)
@@ -99,6 +104,8 @@ db/migrations/
 ```
 
 ### Running Migrations from Filesystem Path
+`RunMigrations` automatically respects the table name configured in `Config.MigrationsTable` (defaulting to `schema_migrations`):
+
 ```go
 const ServiceMigrationLockKey int64 = 0x4d414e474f535643 // Unique 64-bit advisory lock key
 
@@ -125,6 +132,8 @@ if err := db.RunMigrationsWithOptions(ctx, migrationFiles, "db/migrations", opts
 ```
 
 ### Reversing Migrations (Rollback)
+Rollbacks execute strictly in the reverse order of the defined migration sequence (`ORDER BY version DESC`):
+
 ```go
 // Roll back the latest 2 applied migrations
 if err := db.Rollback(ctx, cfg.MigrationsDir, 2, ServiceMigrationLockKey); err != nil {
@@ -184,8 +193,11 @@ func (s *Service) TransferFunds(ctx context.Context, from, to string, amount int
 }
 ```
 
-- **Nested Calls**: If another function invokes `WithinTx` inside an existing transaction on the same database, it participates directly in the outer transaction without savepoints.
-- **Multi-Database Safety**: If `dbB.DB(txCtx)` or `dbB.WithinTx(txCtx)` is called with a context containing an active transaction from `dbA`, it immediately returns a conflict error, preventing unintended cross-database transaction contamination.
+#### Transaction Semantics & Isolation Rules
+- **Same-Database Nesting**: If a function invokes `WithinTx` inside an existing transaction for the same database, it participates directly in the outer transaction without SAVEPOINT overhead.
+- **Aborted State Behavior**: Because nested calls participate directly in the parent transaction, any statement failure leaves the PostgreSQL transaction in an aborted state (`SQLSTATE 25P02`). Catching or ignoring the Go error in a nested function will not recover the transaction; the entire transaction must be rolled back by the outer transaction owner.
+- **Single-DB Scope & 2PC**: This module currently supports single-database transactions. If `dbB.WithinTx` or `dbB.DB` is called with a context carrying an active transaction from `dbA`, it immediately aborts with a conflict error. Distributed two-phase commit (2PC) across multiple databases can be implemented in a future release if required.
+- **Incompatible Options**: Specifying `pgx.TxOptions` (`IsoLevel`, `AccessMode`, or `DeferrableMode`) inside an existing transaction returns a descriptive conflict error.
 
 ### 4. Retry on Serialization & Deadlock (`WithRetryTx`)
 ```go
@@ -214,6 +226,21 @@ func (s *Service) HandleOperation(ctx context.Context) error {
         return nil
     })
 }
+```
+
+---
+
+## Running Integration Tests
+
+Unit tests run completely in-memory without external dependencies:
+```bash
+go test -count=1 -v -race ./...
+```
+
+To run the live PostgreSQL integration tests, set `TEST_POSTGRES_DSN` or `DATABASE_URL`:
+```bash
+export TEST_POSTGRES_DSN="postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
+go test -count=1 -v -race -run TestIntegration ./...
 ```
 
 ---

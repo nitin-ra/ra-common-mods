@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -137,6 +138,13 @@ func (db *Database) WithTxOptions(ctx context.Context, opts pgx.TxOptions, fn fu
 // If an active transaction already exists for this database in ctx, fn directly participates
 // in the existing atomic transaction without creating savepoints or sub-transactions.
 //
+// Distributed Transactions Notice:
+// This package currently supports single-database atomic transactions only and does not
+// support distributed two-phase commit (2PC). If the context already carries an active
+// transaction from a different database instance, WithinTx will immediately abort and return
+// a conflict error rather than executing uncoordinated operations. Distributed 2PC
+// transactions across multiple database instances can be implemented in a future release if required.
+//
 // Note on PostgreSQL transaction behavior:
 // Because nested transactions participate directly in the single parent transaction without SAVEPOINTs,
 // any SQL execution error inside fn will leave the underlying PostgreSQL transaction in an aborted state
@@ -148,23 +156,40 @@ func (db *Database) WithinTx(ctx context.Context, fn func(txCtx context.Context)
 }
 
 // WithinTxOptions executes WithinTx with customized pgx.TxOptions.
-// If called within an existing transaction, specifying incompatible options returns an error.
+// If called within an existing transaction on the same database, specifying incompatible options
+// (IsoLevel, AccessMode, or DeferrableMode) returns a descriptive conflict error.
+// If called with a context containing an active transaction for a different database instance,
+// it returns a cross-database conflict error without executing fn.
 func (db *Database) WithinTxOptions(ctx context.Context, opts pgx.TxOptions, fn func(txCtx context.Context) error) error {
 	if db == nil {
 		return apperror.New(apperror.CodeInternal, "database instance is nil")
 	}
 
-	// 1. Check if a transaction for this database already exists in ctx
+	// 1. Guard against cross-database transaction contamination:
+	// If context carries an active transaction for another database, abort immediately.
+	// This module currently supports single-database transactions only (no distributed 2PC).
+	if ctx != nil {
+		if activeDBs, ok := ctx.Value(activeTxDatabasesKey{}).(map[*Database]struct{}); ok && len(activeDBs) > 0 {
+			if _, hasSelf := activeDBs[db]; !hasSelf {
+				return apperror.New(apperror.CodeConflict, "cross-database transaction detected: context already has an active transaction for another database; distributed transactions (2PC) are not supported")
+			}
+		}
+	}
+
+	// 2. Check if a transaction for this database already exists in ctx (same-database nesting)
 	if existingTx, ok := db.TxFromContext(ctx); ok && existingTx != nil {
 		// Reject incompatible options attempted on an existing transaction
-		if opts.IsoLevel != "" || opts.AccessMode != "" {
-			return apperror.New(apperror.CodeConflict, "cannot apply new transaction options to an existing transaction")
+		if opts.IsoLevel != "" || opts.AccessMode != "" || opts.DeferrableMode != "" {
+			return apperror.New(apperror.CodeConflict, fmt.Sprintf(
+				"cannot apply transaction options (isoLevel=%q, accessMode=%q, deferrableMode=%q) to an existing transaction",
+				opts.IsoLevel, opts.AccessMode, opts.DeferrableMode,
+			))
 		}
 		// Directly participate in existing atomic transaction
 		return fn(ctx)
 	}
 
-	// 2. Start top-level transaction for this database and inject into context
+	// 3. Start top-level transaction for this database and inject into context
 	if db.Pool == nil {
 		return apperror.New(apperror.CodeInternal, "database pool is not initialized")
 	}
