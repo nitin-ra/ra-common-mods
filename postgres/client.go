@@ -16,7 +16,12 @@ type Database struct {
 }
 
 // Connect establishes a connection pool to PostgreSQL and returns a Database wrapper.
+// It validates the provided configuration before parsing DSN or establishing connections.
 func Connect(ctx context.Context, cfg Config, log *slog.Logger) (*Database, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
 	dsn := BuildDSN(cfg)
 
 	poolConfig, err := pgxpool.ParseConfig(dsn)
@@ -62,6 +67,7 @@ func Connect(ctx context.Context, cfg Config, log *slog.Logger) (*Database, erro
 		"host", cfg.Host,
 		"port", cfg.Port,
 		"database", cfg.Database,
+		"sslmode", cfg.SSLMode,
 		"max_conns", poolConfig.MaxConns,
 		"min_conns", poolConfig.MinConns,
 		"max_conn_lifetime", poolConfig.MaxConnLifetime,

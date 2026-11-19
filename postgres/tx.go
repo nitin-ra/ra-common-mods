@@ -3,8 +3,6 @@ package postgres
 import (
 	"context"
 	"errors"
-	"fmt"
-	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -12,53 +10,62 @@ import (
 	"github.com/routerarchitects/ra-common-mods/apperror"
 )
 
-type txContextKey struct{}
-
-var savepointCounter uint64
-
-// ContextWithTx injects an active pgx.Tx transaction handle into the context.
-func ContextWithTx(ctx context.Context, tx pgx.Tx) context.Context {
-	return context.WithValue(ctx, txContextKey{}, tx)
+type txContextKey struct {
+	db *Database
 }
 
-// TxFromContext retrieves an active pgx.Tx transaction handle from context if present.
-func TxFromContext(ctx context.Context) (pgx.Tx, bool) {
-	if ctx == nil {
+type activeTxOwnerKey struct{}
+
+// ContextWithTx injects an active pgx.Tx transaction handle associated with db into the context.
+func ContextWithTx(ctx context.Context, db *Database, tx pgx.Tx) context.Context {
+	if ctx == nil || db == nil || tx == nil {
+		return ctx
+	}
+	ctx = context.WithValue(ctx, txContextKey{db: db}, tx)
+	return context.WithValue(ctx, activeTxOwnerKey{}, db)
+}
+
+// TxFromContext retrieves an active pgx.Tx transaction handle from context associated with this database instance.
+// Returns false if no transaction is active for this database.
+func (db *Database) TxFromContext(ctx context.Context) (pgx.Tx, bool) {
+	if ctx == nil || db == nil {
 		return nil, false
 	}
-	tx, ok := ctx.Value(txContextKey{}).(pgx.Tx)
-	return tx, ok
+	tx, ok := ctx.Value(txContextKey{db: db}).(pgx.Tx)
+	return tx, ok && tx != nil
 }
 
-// DB returns the active pgx.Tx from ctx if one is present (e.g. inside WithinTx);
-// otherwise it returns db.Pool. This allows repository methods to automatically
-// participate in an ongoing transaction without altering their public signatures.
-func (db *Database) DB(ctx context.Context) DBTX {
+// DB returns the active pgx.Tx from ctx if one is present for this database instance;
+// otherwise it returns db.Pool.
+// If the context contains an active transaction belonging to a DIFFERENT database instance,
+// it returns an explicit error to prevent accidental cross-database query execution.
+func (db *Database) DB(ctx context.Context) (DBTX, error) {
 	if db == nil {
-		return nil
+		return nil, apperror.New(apperror.CodeInternal, "database instance is nil")
 	}
-	if tx, ok := TxFromContext(ctx); ok && tx != nil {
-		return tx
-	}
-	if db.Pool == nil {
-		return nil
-	}
-	return db.Pool
-}
 
-// NonTx ALWAYS returns the underlying db.Pool, bypassing any active transaction in the context.
-// Use this as an escape hatch when writing un-rollbackable side-effects (such as audit logs
-// or security alerts) that must persist even if the surrounding transaction fails.
-func (db *Database) NonTx() DBTX {
-	if db == nil || db.Pool == nil {
-		return nil
+	if tx, ok := db.TxFromContext(ctx); ok {
+		return tx, nil
 	}
-	return db.Pool
+
+	// Guard against cross-database transaction contamination
+	if ctx != nil {
+		if activeOwner, ok := ctx.Value(activeTxOwnerKey{}).(*Database); ok && activeOwner != nil && activeOwner != db {
+			return nil, apperror.New(apperror.CodeConflict, "context contains a transaction belonging to a different database instance")
+		}
+	}
+
+	if db.Pool == nil {
+		return nil, apperror.New(apperror.CodeInternal, "database pool is not initialized")
+	}
+
+	return db.Pool, nil
 }
 
 // WithTx executes fn within an atomic PostgreSQL transaction.
 // If fn returns nil, the transaction is committed.
-// If fn returns an error or panics, the transaction is safely rolled back.
+// If fn returns an error or panics, the transaction is safely rolled back using a detached context
+// to ensure connection cleanup even if ctx has already been cancelled.
 func (db *Database) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
 	return db.WithTxOptions(ctx, pgx.TxOptions{}, fn)
 }
@@ -77,10 +84,16 @@ func (db *Database) WithTxOptions(ctx context.Context, opts pgx.TxOptions, fn fu
 
 	defer func() {
 		if p := recover(); p != nil {
-			_ = tx.Rollback(ctx)
+			// Detached context ensures rollback succeeds even if ctx was cancelled
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = tx.Rollback(rollbackCtx)
+			cancel()
 			panic(p) // Re-throw panic after rollback to preserve caller diagnostics
 		} else if err != nil {
-			if rbErr := tx.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			rbErr := tx.Rollback(rollbackCtx)
+			cancel()
+			if rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
 				if db.log != nil {
 					db.log.ErrorContext(ctx, "failed to rollback transaction", "error", rbErr)
 				}
@@ -96,57 +109,52 @@ func (db *Database) WithTxOptions(ctx context.Context, opts pgx.TxOptions, fn fu
 	return err
 }
 
-// WithinTx wraps fn in a transaction and propagates it via the returned context.
-// If a transaction is already active in ctx, WithinTx creates an isolated SAVEPOINT.
-// If the inner block fails, only the savepoint is rolled back, preventing whole-transaction aborts.
+// WithinTx wraps fn in a context-propagated transaction.
+// If an active transaction already exists for this database in ctx, fn directly participates
+// in the existing transaction without creating savepoints or sub-transactions.
+// If the context contains a transaction from a different database instance, an explicit conflict error is returned.
 func (db *Database) WithinTx(ctx context.Context, fn func(txCtx context.Context) error) error {
 	return db.WithinTxOptions(ctx, pgx.TxOptions{}, fn)
 }
 
 // WithinTxOptions executes WithinTx with customized pgx.TxOptions.
+// If called within an existing transaction, specifying incompatible options returns an error.
 func (db *Database) WithinTxOptions(ctx context.Context, opts pgx.TxOptions, fn func(txCtx context.Context) error) error {
-	if db == nil || db.Pool == nil {
+	if db == nil {
+		return apperror.New(apperror.CodeInternal, "database instance is nil")
+	}
+
+	// 1. Guard against cross-database transaction conflict
+	if ctx != nil {
+		if activeOwner, ok := ctx.Value(activeTxOwnerKey{}).(*Database); ok && activeOwner != nil && activeOwner != db {
+			return apperror.New(apperror.CodeConflict, "cannot start transaction: context already has an active transaction for a different database")
+		}
+	}
+
+	// 2. Check if a transaction for this database already exists in ctx
+	if existingTx, ok := db.TxFromContext(ctx); ok && existingTx != nil {
+		// Reject incompatible options attempted on an existing transaction
+		if opts.IsoLevel != "" || opts.AccessMode != "" {
+			return apperror.New(apperror.CodeConflict, "cannot apply new transaction options to an existing transaction")
+		}
+		// Directly participate in existing atomic transaction
+		return fn(ctx)
+	}
+
+	// 3. Start top-level transaction and inject into context
+	if db.Pool == nil {
 		return apperror.New(apperror.CodeInternal, "database pool is not initialized")
 	}
 
-	parentTx, hasParent := TxFromContext(ctx)
-	if !hasParent || parentTx == nil {
-		// Top-level transaction: begin real transaction and store in context
-		return db.WithTxOptions(ctx, opts, func(tx pgx.Tx) error {
-			txCtx := ContextWithTx(ctx, tx)
-			return fn(txCtx)
-		})
-	}
-
-	// Nested transaction: execute inside PostgreSQL SAVEPOINT
-	count := atomic.AddUint64(&savepointCounter, 1)
-	spName := fmt.Sprintf("sp_%d", count)
-
-	if _, err := parentTx.Exec(ctx, "SAVEPOINT "+spName); err != nil {
-		return apperror.Wrap(apperror.CodeInternal, "failed to create savepoint", err)
-	}
-
-	err := fn(ctx)
-	if err != nil {
-		// Roll back to savepoint on error
-		if _, rbErr := parentTx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+spName); rbErr != nil {
-			if db.log != nil {
-				db.log.ErrorContext(ctx, "failed to rollback to savepoint", "savepoint", spName, "error", rbErr)
-			}
-		}
-		return err
-	}
-
-	// Release savepoint on success
-	if _, err := parentTx.Exec(ctx, "RELEASE SAVEPOINT "+spName); err != nil {
-		return apperror.Wrap(apperror.CodeInternal, "failed to release savepoint", err)
-	}
-
-	return nil
+	return db.WithTxOptions(ctx, opts, func(tx pgx.Tx) error {
+		txCtx := ContextWithTx(ctx, db, tx)
+		return fn(txCtx)
+	})
 }
 
 // WithRetryTx executes fn in a transaction, automatically retrying if a transient
 // serialization failure (PostgreSQL SQLSTATE 40001) or deadlock (PostgreSQL SQLSTATE 40P01) occurs.
+// Note: fn may be invoked multiple times and must not perform irreversible external side-effects.
 func (db *Database) WithRetryTx(ctx context.Context, maxRetries int, fn func(tx pgx.Tx) error) error {
 	if maxRetries < 0 {
 		maxRetries = 0
@@ -161,6 +169,11 @@ func (db *Database) WithRetryTx(ctx context.Context, maxRetries int, fn func(tx 
 
 		var pgErr *pgconn.PgError
 		if errors.As(lastErr, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01") {
+			// Do not sleep after final attempt
+			if attempt == maxRetries {
+				return lastErr
+			}
+
 			// Transient error; back off and retry if context is still valid
 			select {
 			case <-ctx.Done():

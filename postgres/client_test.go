@@ -30,6 +30,23 @@ func TestDatabase_Close_NilPool(t *testing.T) {
 	database.Close()
 }
 
+func TestConnect_ValidationFailure(t *testing.T) {
+	cfg := postgres.Config{
+		Host:     "localhost",
+		Port:     -1, // Invalid port
+		Username: "postgres",
+		Database: "postgres",
+	}
+
+	_, err := postgres.Connect(context.Background(), cfg, slog.Default())
+	if err == nil {
+		t.Fatal("expected validation error on invalid port, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid postgres port") {
+		t.Fatalf("expected invalid postgres port error, got: %v", err)
+	}
+}
+
 func TestConnect_UnreachableDatabase_Timeout(t *testing.T) {
 	cfg := postgres.Config{
 		Host:               "127.0.0.1",
@@ -65,11 +82,8 @@ func TestDatabase_Logger(t *testing.T) {
 		t.Error("expected non-nil default logger on nil Database")
 	}
 
-	customLogger := slog.New(slog.DiscardHandler)
 	db := &postgres.Database{Pool: nil}
-	// By default log is nil
 	if db.Logger() == nil {
 		t.Error("expected non-nil fallback logger when log field is nil")
 	}
-	_ = customLogger
 }

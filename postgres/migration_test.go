@@ -54,6 +54,76 @@ func TestMigration_MissingDownFile(t *testing.T) {
 	}
 }
 
+func TestMigration_DuplicateVersion(t *testing.T) {
+	database := &postgres.Database{Pool: nil}
+
+	mapFS := fstest.MapFS{
+		"migrations/000001_init.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE items (id INT);"),
+		},
+		"migrations/000001_init.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE items;"),
+		},
+	}
+
+	// Run with valid lock key
+	err := database.RunMigrationsFS(context.Background(), mapFS, "migrations", testAdvisoryLockKey)
+	if err == nil || !strings.Contains(err.Error(), "database pool is not initialized") {
+		t.Fatalf("expected nil pool error, got: %v", err)
+	}
+}
+
+func TestMigration_AdvisoryLockKeyZeroRejection(t *testing.T) {
+	database := &postgres.Database{Pool: nil}
+
+	mapFS := fstest.MapFS{
+		"migrations/000001_init.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE items (id INT);"),
+		},
+		"migrations/000001_init.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE items;"),
+		},
+	}
+
+	// Run with advisoryLockKey = 0 must fail fast
+	err := database.RunMigrationsFS(context.Background(), mapFS, "migrations", 0)
+	if err == nil || !strings.Contains(err.Error(), "advisory lock key must not be 0") {
+		t.Fatalf("expected advisory lock key 0 rejection, got: %v", err)
+	}
+
+	err = database.RollbackFS(context.Background(), mapFS, "migrations", 1, 0)
+	if err == nil || !strings.Contains(err.Error(), "advisory lock key must not be 0") {
+		t.Fatalf("expected advisory lock key 0 rejection on rollback, got: %v", err)
+	}
+}
+
+func TestMigration_InvalidTableName(t *testing.T) {
+	database := &postgres.Database{Pool: nil}
+	mapFS := fstest.MapFS{
+		"migrations/000001_init.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE items (id INT);"),
+		},
+		"migrations/000001_init.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE items;"),
+		},
+	}
+
+	opts := postgres.MigrationOptions{
+		TableName:       "123_invalid-table; DROP TABLE users;",
+		AdvisoryLockKey: testAdvisoryLockKey,
+	}
+
+	err := database.RunMigrationsWithOptions(context.Background(), mapFS, "migrations", opts)
+	if err == nil || !strings.Contains(err.Error(), "invalid migrations table name") {
+		t.Fatalf("expected invalid table name error, got: %v", err)
+	}
+
+	err = database.RollbackWithOptions(context.Background(), mapFS, "migrations", 1, opts)
+	if err == nil || !strings.Contains(err.Error(), "invalid migrations table name") {
+		t.Fatalf("expected invalid table name error on rollback, got: %v", err)
+	}
+}
+
 func TestMigration_NilPool(t *testing.T) {
 	database := &postgres.Database{Pool: nil}
 	dir := t.TempDir()

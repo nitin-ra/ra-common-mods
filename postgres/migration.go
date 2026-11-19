@@ -2,11 +2,13 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -15,26 +17,62 @@ import (
 	"github.com/routerarchitects/ra-common-mods/apperror"
 )
 
+var validTableNameRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// MigrationOptions configures the execution of database schema migrations.
+type MigrationOptions struct {
+	TableName       string // Table name for tracking migrations (defaults to "schema_migrations")
+	AdvisoryLockKey int64  // Required 64-bit advisory lock key to serialize concurrent runs
+}
+
+func sanitizeTableName(table string) (string, error) {
+	name := strings.TrimSpace(table)
+	if name == "" {
+		return "schema_migrations", nil
+	}
+	if !validTableNameRegex.MatchString(name) {
+		return "", apperror.New(apperror.CodeInvalidInput, fmt.Sprintf("invalid migrations table name %q: must match identifier pattern [a-zA-Z_][a-zA-Z0-9_]*", name))
+	}
+	return name, nil
+}
+
 // RunMigrations automatically scans and applies forward SQL migrations (*.up.sql) from migrationsDir.
 // It acquires a PostgreSQL session-level advisory lock using advisoryLockKey to serialize migrations across concurrent instances.
 func (db *Database) RunMigrations(ctx context.Context, migrationsDir string, advisoryLockKey int64) error {
 	if _, err := os.Stat(migrationsDir); os.IsNotExist(err) {
-		return apperror.New(apperror.CodeInternal, fmt.Sprintf("database migrations directory '%s' does not exist", migrationsDir))
+		return apperror.New(apperror.CodeNotFound, fmt.Sprintf("migrations directory %q does not exist", migrationsDir))
 	}
-	return db.runMigrationsInternal(ctx, os.DirFS(migrationsDir), ".", advisoryLockKey)
+	return db.RunMigrationsWithOptions(ctx, os.DirFS(migrationsDir), ".", MigrationOptions{
+		TableName:       "schema_migrations",
+		AdvisoryLockKey: advisoryLockKey,
+	})
 }
 
 // RunMigrationsFS executes forward migrations from an arbitrary fs.FS filesystem (e.g. embed.FS or os.DirFS).
 func (db *Database) RunMigrationsFS(ctx context.Context, fsys fs.FS, dir string, advisoryLockKey int64) error {
-	if dir == "" {
-		dir = "."
-	}
-	return db.runMigrationsInternal(ctx, fsys, dir, advisoryLockKey)
+	return db.RunMigrationsWithOptions(ctx, fsys, dir, MigrationOptions{
+		TableName:       "schema_migrations",
+		AdvisoryLockKey: advisoryLockKey,
+	})
 }
 
-func (db *Database) runMigrationsInternal(ctx context.Context, fsys fs.FS, dir string, advisoryLockKey int64) error {
+// RunMigrationsWithOptions executes forward migrations using custom MigrationOptions (table name and advisory lock key).
+func (db *Database) RunMigrationsWithOptions(ctx context.Context, fsys fs.FS, dir string, opts MigrationOptions) error {
 	if fsys == nil {
 		return apperror.New(apperror.CodeInternal, "migrations filesystem must not be nil")
+	}
+
+	if opts.AdvisoryLockKey == 0 {
+		return apperror.New(apperror.CodeInvalidInput, "advisory lock key must not be 0: required to prevent concurrent migration race conditions")
+	}
+
+	tableName, err := sanitizeTableName(opts.TableName)
+	if err != nil {
+		return err
+	}
+
+	if dir == "" {
+		dir = "."
 	}
 
 	entries, err := fs.ReadDir(fsys, dir)
@@ -43,9 +81,15 @@ func (db *Database) runMigrationsInternal(ctx context.Context, fsys fs.FS, dir s
 	}
 
 	var upFiles []string
+	upFileMap := make(map[string]bool)
 	for _, entry := range entries {
 		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".up.sql") {
 			upFiles = append(upFiles, entry.Name())
+			version := strings.TrimSuffix(entry.Name(), ".up.sql")
+			if upFileMap[version] {
+				return apperror.New(apperror.CodeConflict, fmt.Sprintf("duplicate migration version detected: %s", version))
+			}
+			upFileMap[version] = true
 		}
 	}
 
@@ -74,7 +118,7 @@ func (db *Database) runMigrationsInternal(ctx context.Context, fsys fs.FS, dir s
 	}
 
 	if db.log != nil {
-		db.log.InfoContext(ctx, "checking database migrations", "directory", dir)
+		db.log.InfoContext(ctx, "checking database migrations", "directory", dir, "table", tableName)
 	}
 
 	// Sort migrations lexicographically (e.g. 000001_core_schema.up.sql)
@@ -87,34 +131,60 @@ func (db *Database) runMigrationsInternal(ctx context.Context, fsys fs.FS, dir s
 	}
 	defer conn.Release()
 
-	// Acquire advisory lock using unique 64-bit key if provided
-	if advisoryLockKey != 0 {
-		if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", advisoryLockKey); err != nil {
-			return apperror.Wrap(apperror.CodeInternal, "failed to acquire migration advisory lock", err)
-		}
-		defer func() {
-			unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			var unlocked bool
-			if err := conn.QueryRow(unlockCtx, "SELECT pg_advisory_unlock($1)", advisoryLockKey).Scan(&unlocked); err != nil || !unlocked {
-				if db.log != nil {
-					db.log.ErrorContext(ctx, "failed to release migration advisory lock; terminating connection", "error", err, "unlocked", unlocked)
-				}
-				_ = conn.Conn().Close(context.Background())
-			}
-		}()
+	// Acquire advisory lock
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", opts.AdvisoryLockKey); err != nil {
+		return apperror.Wrap(apperror.CodeInternal, "failed to acquire migration advisory lock", err)
 	}
+	defer func() {
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	// Initialize tracking table
-	createTableSQL := `
-		CREATE TABLE IF NOT EXISTS schema_migrations (
+		var unlocked bool
+		if err := conn.QueryRow(unlockCtx, "SELECT pg_advisory_unlock($1)", opts.AdvisoryLockKey).Scan(&unlocked); err != nil || !unlocked {
+			if db.log != nil {
+				db.log.ErrorContext(ctx, "failed to release migration advisory lock; terminating connection", "error", err, "unlocked", unlocked)
+			}
+			_ = conn.Conn().Close(context.Background())
+		}
+	}()
+
+	// Initialize tracking table with checksum column
+	createTableSQL := fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
 			version VARCHAR(255) PRIMARY KEY,
+			checksum VARCHAR(64) NOT NULL,
 			applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 		);
-	`
+		ALTER TABLE %s ADD COLUMN IF NOT EXISTS checksum VARCHAR(64) DEFAULT '';
+	`, tableName, tableName)
 	if _, err := conn.Exec(ctx, createTableSQL); err != nil {
-		return apperror.Wrap(apperror.CodeInternal, "failed to create schema_migrations table", err)
+		return apperror.Wrap(apperror.CodeInternal, fmt.Sprintf("failed to create or migrate %s table", tableName), err)
+	}
+
+	// Read all currently applied migrations from the database
+	rows, err := conn.Query(ctx, fmt.Sprintf("SELECT version, checksum FROM %s", tableName))
+	if err != nil {
+		return apperror.Wrap(apperror.CodeInternal, fmt.Sprintf("failed to query %s table", tableName), err)
+	}
+	defer rows.Close()
+
+	appliedMigrations := make(map[string]string)
+	for rows.Next() {
+		var v, chk string
+		if err := rows.Scan(&v, &chk); err != nil {
+			return apperror.Wrap(apperror.CodeInternal, "failed to scan applied migration row", err)
+		}
+		appliedMigrations[v] = chk
+	}
+	if err := rows.Err(); err != nil {
+		return apperror.Wrap(apperror.CodeInternal, "failed to read applied migration history", err)
+	}
+
+	// Verify that applied database migrations exist in the local migration set
+	for appliedVer := range appliedMigrations {
+		if !upFileMap[appliedVer] {
+			return apperror.New(apperror.CodeConflict, fmt.Sprintf("migration %q was previously applied to database but is missing from migration source", appliedVer))
+		}
 	}
 
 	for _, file := range upFiles {
@@ -124,15 +194,19 @@ func (db *Database) runMigrationsInternal(ctx context.Context, fsys fs.FS, dir s
 			filePath = path.Join(dir, file)
 		}
 
-		// Check if this migration was already applied
-		var exists bool
-		checkSQL := `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`
-		err := conn.QueryRow(ctx, checkSQL, version).Scan(&exists)
+		content, err := fs.ReadFile(fsys, filePath)
 		if err != nil {
-			return apperror.Wrap(apperror.CodeInternal, fmt.Sprintf("failed to check migration state for %s", version), err)
+			return apperror.Wrap(apperror.CodeInternal, fmt.Sprintf("failed to read migration file %s", file), err)
 		}
 
-		if exists {
+		fileChecksum := fmt.Sprintf("%x", sha256.Sum256(content))
+
+		// Check if migration was already applied
+		if storedChecksum, alreadyApplied := appliedMigrations[version]; alreadyApplied {
+			// Validate checksum integrity
+			if storedChecksum != "" && storedChecksum != fileChecksum {
+				return apperror.New(apperror.CodeConflict, fmt.Sprintf("migration %q was modified after being applied (stored checksum: %s, file checksum: %s)", version, storedChecksum, fileChecksum))
+			}
 			continue
 		}
 
@@ -140,19 +214,15 @@ func (db *Database) runMigrationsInternal(ctx context.Context, fsys fs.FS, dir s
 			db.log.InfoContext(ctx, "applying database migration", "version", version, "file", file)
 		}
 
-		content, err := fs.ReadFile(fsys, filePath)
-		if err != nil {
-			return apperror.Wrap(apperror.CodeInternal, fmt.Sprintf("failed to read migration file %s", file), err)
-		}
-
-		// Run the migration in an isolated transaction
+		// Run the migration script in an isolated transaction using Simple Protocol (parameterless Exec)
+		// Parameterless execution supports multi-statement scripts, functions, triggers, and comments
 		err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
 			if _, err := tx.Exec(ctx, string(content)); err != nil {
 				return err
 			}
 
-			insertSQL := `INSERT INTO schema_migrations (version) VALUES ($1)`
-			if _, err := tx.Exec(ctx, insertSQL, version); err != nil {
+			insertSQL := fmt.Sprintf("INSERT INTO %s (version, checksum) VALUES ($1, $2)", tableName)
+			if _, err := tx.Exec(ctx, insertSQL, version, fileChecksum); err != nil {
 				return err
 			}
 			return nil
@@ -168,7 +238,7 @@ func (db *Database) runMigrationsInternal(ctx context.Context, fsys fs.FS, dir s
 	}
 
 	if db.log != nil {
-		db.log.InfoContext(ctx, "all database migrations are up to date")
+		db.log.InfoContext(ctx, "all database migrations are up to date", "table", tableName)
 	}
 	return nil
 }
@@ -180,29 +250,43 @@ func (db *Database) Rollback(ctx context.Context, migrationsDir string, steps in
 		return nil
 	}
 	if _, err := os.Stat(migrationsDir); os.IsNotExist(err) {
-		return apperror.New(apperror.CodeInternal, fmt.Sprintf("database migrations directory '%s' does not exist", migrationsDir))
+		return apperror.New(apperror.CodeNotFound, fmt.Sprintf("migrations directory %q does not exist", migrationsDir))
 	}
-	return db.rollbackInternal(ctx, os.DirFS(migrationsDir), ".", steps, advisoryLockKey)
+	return db.RollbackWithOptions(ctx, os.DirFS(migrationsDir), ".", steps, MigrationOptions{
+		TableName:       "schema_migrations",
+		AdvisoryLockKey: advisoryLockKey,
+	})
 }
 
 // RollbackFS reverses the latest applied migrations up to the specified number of steps from an fs.FS filesystem.
 func (db *Database) RollbackFS(ctx context.Context, fsys fs.FS, dir string, steps int, advisoryLockKey int64) error {
-	if steps <= 0 {
-		return nil
-	}
-	if dir == "" {
-		dir = "."
-	}
-	return db.rollbackInternal(ctx, fsys, dir, steps, advisoryLockKey)
+	return db.RollbackWithOptions(ctx, fsys, dir, steps, MigrationOptions{
+		TableName:       "schema_migrations",
+		AdvisoryLockKey: advisoryLockKey,
+	})
 }
 
-func (db *Database) rollbackInternal(ctx context.Context, fsys fs.FS, dir string, steps int, advisoryLockKey int64) error {
+// RollbackWithOptions reverses migrations using custom MigrationOptions (table name and advisory lock key).
+func (db *Database) RollbackWithOptions(ctx context.Context, fsys fs.FS, dir string, steps int, opts MigrationOptions) error {
 	if steps <= 0 {
 		return nil
 	}
 
 	if fsys == nil {
 		return apperror.New(apperror.CodeInternal, "migrations filesystem must not be nil")
+	}
+
+	if opts.AdvisoryLockKey == 0 {
+		return apperror.New(apperror.CodeInvalidInput, "advisory lock key must not be 0: required to prevent concurrent migration race conditions")
+	}
+
+	tableName, err := sanitizeTableName(opts.TableName)
+	if err != nil {
+		return err
+	}
+
+	if dir == "" {
+		dir = "."
 	}
 
 	if db == nil || db.Pool == nil {
@@ -216,29 +300,40 @@ func (db *Database) rollbackInternal(ctx context.Context, fsys fs.FS, dir string
 	}
 	defer conn.Release()
 
-	// Acquire advisory lock using unique 64-bit key if provided
-	if advisoryLockKey != 0 {
-		if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", advisoryLockKey); err != nil {
-			return apperror.Wrap(apperror.CodeInternal, "failed to acquire migration advisory lock", err)
-		}
-		defer func() {
-			unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
+	// Acquire advisory lock
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", opts.AdvisoryLockKey); err != nil {
+		return apperror.Wrap(apperror.CodeInternal, "failed to acquire migration advisory lock", err)
+	}
+	defer func() {
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-			var unlocked bool
-			if err := conn.QueryRow(unlockCtx, "SELECT pg_advisory_unlock($1)", advisoryLockKey).Scan(&unlocked); err != nil || !unlocked {
-				if db.log != nil {
-					db.log.ErrorContext(ctx, "failed to release migration advisory lock; terminating connection", "error", err, "unlocked", unlocked)
-				}
-				_ = conn.Conn().Close(context.Background())
+		var unlocked bool
+		if err := conn.QueryRow(unlockCtx, "SELECT pg_advisory_unlock($1)", opts.AdvisoryLockKey).Scan(&unlocked); err != nil || !unlocked {
+			if db.log != nil {
+				db.log.ErrorContext(ctx, "failed to release migration advisory lock; terminating connection", "error", err, "unlocked", unlocked)
 			}
-		}()
+			_ = conn.Conn().Close(context.Background())
+		}
+	}()
+
+	// Verify that the migrations table exists before attempting to read applied records
+	var tableExists bool
+	checkTableSQL := `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.tables 
+			WHERE table_name = $1 AND table_schema = current_schema()
+		);
+	`
+	if err := conn.QueryRow(ctx, checkTableSQL, tableName).Scan(&tableExists); err != nil || !tableExists {
+		return apperror.New(apperror.CodeNotFound, fmt.Sprintf("migration history table %q does not exist; cannot perform rollback", tableName))
 	}
 
 	// Query applied migrations in reverse chronological order
-	rows, err := conn.Query(ctx, `SELECT version FROM schema_migrations ORDER BY applied_at DESC, version DESC LIMIT $1`, steps)
+	querySQL := fmt.Sprintf(`SELECT version FROM %s ORDER BY applied_at DESC, version DESC LIMIT $1`, tableName)
+	rows, err := conn.Query(ctx, querySQL, steps)
 	if err != nil {
-		return apperror.Wrap(apperror.CodeInternal, "failed to query applied schema migrations", err)
+		return apperror.Wrap(apperror.CodeInternal, fmt.Sprintf("failed to query applied schema migrations from %s", tableName), err)
 	}
 	defer rows.Close()
 
@@ -270,13 +365,13 @@ func (db *Database) rollbackInternal(ctx context.Context, fsys fs.FS, dir string
 			db.log.InfoContext(ctx, "rolling back database migration", "version", version, "file", downFile)
 		}
 
-		// Run rollback script in an isolated transaction
+		// Run rollback script in an isolated transaction using Simple Protocol
 		err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
 			if _, err := tx.Exec(ctx, string(content)); err != nil {
 				return err
 			}
 
-			deleteSQL := `DELETE FROM schema_migrations WHERE version = $1`
+			deleteSQL := fmt.Sprintf("DELETE FROM %s WHERE version = $1", tableName)
 			if _, err := tx.Exec(ctx, deleteSQL, version); err != nil {
 				return err
 			}
