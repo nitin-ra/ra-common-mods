@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -13,47 +12,76 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/routerarchitects/ra-common-mods/postgres"
 )
 
-func getIntegrationDB(t *testing.T) *postgres.Database {
-	dsn := os.Getenv("TEST_POSTGRES_DSN")
+// getIntegrationDB connects to the database specified by TEST_POSTGRES_DSN (or DATABASE_URL).
+// To ensure complete test safety and prevent destructive changes on shared databases,
+// it creates an isolated test schema for the duration of the test and configures search_path accordingly.
+func getIntegrationDB(t *testing.T) (*postgres.Database, func()) {
+	dsn := strings.TrimSpace(os.Getenv("TEST_POSTGRES_DSN"))
 	if dsn == "" {
-		dsn = os.Getenv("DATABASE_URL")
+		dsn = strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	}
 	if dsn == "" {
 		t.Skip("skipping PostgreSQL integration test: set TEST_POSTGRES_DSN or DATABASE_URL to enable")
 	}
 
-	cfg, err := postgres.DefaultConfig()
+	poolConfig, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		t.Fatalf("failed to parse default config: %v", err)
+		t.Fatalf("failed to parse configured TEST_POSTGRES_DSN: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	db, err := postgres.Connect(ctx, cfg, slog.Default())
+	// Initial connection to setup the isolated schema
+	setupPool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
-		t.Skipf("skipping PostgreSQL integration test (could not connect to %s): %v", cfg.Host, err)
+		t.Fatalf("failed to connect to configured integration test database: %v", err)
+	}
+	if err := setupPool.Ping(ctx); err != nil {
+		setupPool.Close()
+		t.Fatalf("configured integration test database is unreachable: %v", err)
 	}
 
-	return db
+	// Create an isolated schema for this test run
+	schemaName := fmt.Sprintf("test_integ_%d", time.Now().UnixNano())
+	if _, err := setupPool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %s", schemaName)); err != nil {
+		setupPool.Close()
+		t.Fatalf("failed to create isolated test schema %s: %v", schemaName, err)
+	}
+	setupPool.Close()
+
+	// Connect with search_path scoped to the isolated schema
+	poolConfig.ConnConfig.RuntimeParams["search_path"] = schemaName
+	isolatedPool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		t.Fatalf("failed to initialize pool with isolated schema search_path: %v", err)
+	}
+
+	db := &postgres.Database{
+		Pool: isolatedPool,
+	}
+
+	cleanup := func() {
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanCancel()
+		_, _ = isolatedPool.Exec(cleanCtx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schemaName))
+		isolatedPool.Close()
+	}
+
+	return db, cleanup
 }
 
 func TestIntegration_MultiStatementMigrationAndRollback(t *testing.T) {
-	db := getIntegrationDB(t)
-	defer db.Close()
+	db, cleanup := getIntegrationDB(t)
+	defer cleanup()
 
 	ctx := context.Background()
 	lockKey := int64(0x494e544547303031) // INTEG001
 	tableName := "integ_test_schema_migrations"
-
-	// Cleanup any previous run
-	_, _ = db.Pool.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s, integ_orders, integ_users CASCADE", tableName))
-	defer func() {
-		_, _ = db.Pool.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s, integ_orders, integ_users CASCADE", tableName))
-	}()
 
 	migrations := fstest.MapFS{
 		"migrations/000001_initial_schema.up.sql": &fstest.MapFile{
@@ -113,17 +141,12 @@ func TestIntegration_MultiStatementMigrationAndRollback(t *testing.T) {
 }
 
 func TestIntegration_AdvisoryLockConcurrency(t *testing.T) {
-	db := getIntegrationDB(t)
-	defer db.Close()
+	db, cleanup := getIntegrationDB(t)
+	defer cleanup()
 
 	ctx := context.Background()
 	lockKey := int64(0x494e544547303032)
 	tableName := "integ_concurrent_migrations"
-
-	_, _ = db.Pool.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s, integ_items CASCADE", tableName))
-	defer func() {
-		_, _ = db.Pool.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s, integ_items CASCADE", tableName))
-	}()
 
 	migrations := fstest.MapFS{
 		"migrations/000001_items.up.sql": &fstest.MapFile{
@@ -162,11 +185,13 @@ func TestIntegration_AdvisoryLockConcurrency(t *testing.T) {
 }
 
 func TestIntegration_TransactionCommitRollbackAndPanic(t *testing.T) {
-	db := getIntegrationDB(t)
-	defer db.Close()
+	db, cleanup := getIntegrationDB(t)
+	defer cleanup()
 
 	ctx := context.Background()
-	_, _ = db.Pool.Exec(ctx, "CREATE TEMP TABLE tx_test_items (name VARCHAR(64))")
+	if _, err := db.Pool.Exec(ctx, "CREATE TABLE tx_test_items (name VARCHAR(64))"); err != nil {
+		t.Fatalf("failed to create test table: %v", err)
+	}
 
 	// 1. Commit on success
 	err := db.WithTx(ctx, func(tx pgx.Tx) error {
@@ -220,13 +245,15 @@ func TestIntegration_TransactionCommitRollbackAndPanic(t *testing.T) {
 }
 
 func TestIntegration_WithinTx_SameDBReuse_And_CrossDBRejection(t *testing.T) {
-	dbA := getIntegrationDB(t)
-	defer dbA.Close()
+	dbA, cleanup := getIntegrationDB(t)
+	defer cleanup()
 
 	dbB := &postgres.Database{Pool: nil} // Second db instance without pool
 
 	ctx := context.Background()
-	_, _ = dbA.Pool.Exec(ctx, "CREATE TEMP TABLE nested_test_items (val INT)")
+	if _, err := dbA.Pool.Exec(ctx, "CREATE TABLE nested_test_items (val INT)"); err != nil {
+		t.Fatalf("failed to create test table: %v", err)
+	}
 
 	// Test same-DB nesting and cross-DB rejection
 	err := dbA.WithinTx(ctx, func(txCtx context.Context) error {
@@ -270,5 +297,129 @@ func TestIntegration_WithinTx_SameDBReuse_And_CrossDBRejection(t *testing.T) {
 
 	if err != nil {
 		t.Fatalf("expected WithinTx to succeed, got: %v", err)
+	}
+}
+
+func TestIntegration_OutOfOrderMigrationRejection(t *testing.T) {
+	db, cleanup := getIntegrationDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	lockKey := int64(0x494e544547303033)
+	tableName := "integ_ooo_migrations"
+
+	opts := postgres.MigrationOptions{
+		TableName:       tableName,
+		AdvisoryLockKey: lockKey,
+	}
+
+	// Step 1: Apply version 000001 and 000003
+	initialMigrations := fstest.MapFS{
+		"migrations/000001_first.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE integ_m1 (id INT);"),
+		},
+		"migrations/000001_first.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE integ_m1;"),
+		},
+		"migrations/000003_third.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE integ_m3 (id INT);"),
+		},
+		"migrations/000003_third.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE integ_m3;"),
+		},
+	}
+
+	if err := db.RunMigrationsWithOptions(ctx, initialMigrations, "migrations", opts); err != nil {
+		t.Fatalf("failed to apply initial migrations: %v", err)
+	}
+
+	// Step 2: Introduce unapplied older version 000002
+	oooMigrations := fstest.MapFS{
+		"migrations/000001_first.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE integ_m1 (id INT);"),
+		},
+		"migrations/000001_first.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE integ_m1;"),
+		},
+		"migrations/000002_second.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE integ_m2 (id INT);"),
+		},
+		"migrations/000002_second.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE integ_m2;"),
+		},
+		"migrations/000003_third.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE integ_m3 (id INT);"),
+		},
+		"migrations/000003_third.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE integ_m3;"),
+		},
+	}
+
+	err := db.RunMigrationsWithOptions(ctx, oooMigrations, "migrations", opts)
+	if err == nil {
+		t.Fatal("expected out-of-order migration to be rejected, got nil")
+	}
+	if !strings.Contains(err.Error(), "out-of-order migration detected") {
+		t.Fatalf("expected out-of-order conflict error, got: %v", err)
+	}
+}
+
+func TestIntegration_ChecksumBackfillAndTamperDetection(t *testing.T) {
+	db, cleanup := getIntegrationDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	lockKey := int64(0x494e544547303034)
+	tableName := "integ_checksum_migrations"
+
+	opts := postgres.MigrationOptions{
+		TableName:       tableName,
+		AdvisoryLockKey: lockKey,
+	}
+
+	migrations := fstest.MapFS{
+		"migrations/000001_init.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE integ_chktable (id INT);"),
+		},
+		"migrations/000001_init.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE integ_chktable;"),
+		},
+	}
+
+	// 1. Run migration normally
+	if err := db.RunMigrationsWithOptions(ctx, migrations, "migrations", opts); err != nil {
+		t.Fatalf("failed initial migration: %v", err)
+	}
+
+	// 2. Clear the checksum in database to simulate a legacy record
+	quotedTable := pgx.Identifier{tableName}.Sanitize()
+	if _, err := db.Pool.Exec(ctx, fmt.Sprintf("UPDATE %s SET checksum = '' WHERE version = '000001_init'", quotedTable)); err != nil {
+		t.Fatalf("failed to simulate legacy empty checksum: %v", err)
+	}
+
+	// 3. Re-run migration -> should backfill checksum successfully
+	if err := db.RunMigrationsWithOptions(ctx, migrations, "migrations", opts); err != nil {
+		t.Fatalf("expected successful checksum backfill, got: %v", err)
+	}
+
+	// Verify backfilled checksum is not empty
+	var backfilledChecksum string
+	if err := db.Pool.QueryRow(ctx, fmt.Sprintf("SELECT checksum FROM %s WHERE version = '000001_init'", quotedTable)).Scan(&backfilledChecksum); err != nil || backfilledChecksum == "" {
+		t.Fatalf("expected non-empty backfilled checksum, got %q, err: %v", backfilledChecksum, err)
+	}
+
+	// 4. Tamper with file content
+	tamperedMigrations := fstest.MapFS{
+		"migrations/000001_init.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE integ_chktable (id INT, tampered BOOLEAN);"),
+		},
+		"migrations/000001_init.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE integ_chktable;"),
+		},
+	}
+
+	err := db.RunMigrationsWithOptions(ctx, tamperedMigrations, "migrations", opts)
+	if err == nil || !strings.Contains(err.Error(), "was modified after being applied") {
+		t.Fatalf("expected checksum mismatch error, got: %v", err)
 	}
 }

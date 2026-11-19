@@ -161,6 +161,8 @@ func (db *Database) RunMigrationsWithOptions(ctx context.Context, fsys fs.FS, di
 		}
 	}()
 
+	quotedTable := pgx.Identifier{tableName}.Sanitize()
+
 	// Initialize tracking table with checksum column
 	createTableSQL := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s (
@@ -169,13 +171,13 @@ func (db *Database) RunMigrationsWithOptions(ctx context.Context, fsys fs.FS, di
 			applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 		);
 		ALTER TABLE %s ADD COLUMN IF NOT EXISTS checksum VARCHAR(64) DEFAULT '';
-	`, tableName, tableName)
+	`, quotedTable, quotedTable)
 	if _, err := conn.Exec(ctx, createTableSQL); err != nil {
 		return apperror.Wrap(apperror.CodeInternal, fmt.Sprintf("failed to create or migrate %s table", tableName), err)
 	}
 
 	// Read all currently applied migrations from the database
-	rows, err := conn.Query(ctx, fmt.Sprintf("SELECT version, checksum FROM %s", tableName))
+	rows, err := conn.Query(ctx, fmt.Sprintf("SELECT version, checksum FROM %s", quotedTable))
 	if err != nil {
 		return apperror.Wrap(apperror.CodeInternal, fmt.Sprintf("failed to query %s table", tableName), err)
 	}
@@ -194,9 +196,13 @@ func (db *Database) RunMigrationsWithOptions(ctx context.Context, fsys fs.FS, di
 	}
 
 	// Verify that applied database migrations exist in the local migration set
+	var latestAppliedVersion string
 	for appliedVer := range appliedMigrations {
 		if !upFileMap[appliedVer] {
 			return apperror.New(apperror.CodeConflict, fmt.Sprintf("migration %q was previously applied to database but is missing from migration source", appliedVer))
+		}
+		if appliedVer > latestAppliedVersion {
+			latestAppliedVersion = appliedVer
 		}
 	}
 
@@ -221,10 +227,20 @@ func (db *Database) RunMigrationsWithOptions(ctx context.Context, fsys fs.FS, di
 				return apperror.New(apperror.CodeConflict, fmt.Sprintf("migration %q was modified after being applied (stored checksum: %s, file checksum: %s)", version, storedChecksum, fileChecksum))
 			}
 			if storedChecksum == "" {
-				updateSQL := fmt.Sprintf("UPDATE %s SET checksum = $1 WHERE version = $2", tableName)
-				_, _ = conn.Exec(ctx, updateSQL, fileChecksum, version)
+				updateSQL := fmt.Sprintf("UPDATE %s SET checksum = $1 WHERE version = $2", quotedTable)
+				if _, err := conn.Exec(ctx, updateSQL, fileChecksum, version); err != nil {
+					return apperror.Wrap(apperror.CodeInternal, fmt.Sprintf("failed to backfill checksum for migration %q in %s", version, tableName), err)
+				}
+				if db.log != nil {
+					db.log.InfoContext(ctx, "backfilled checksum for legacy migration", "version", version, "table", tableName)
+				}
 			}
 			continue
+		}
+
+		// Reject out-of-order unapplied migrations if a higher version was already applied
+		if latestAppliedVersion != "" && version < latestAppliedVersion {
+			return apperror.New(apperror.CodeConflict, fmt.Sprintf("out-of-order migration detected: %q cannot be applied because higher version %q is already applied", version, latestAppliedVersion))
 		}
 
 		if db.log != nil {
@@ -238,7 +254,7 @@ func (db *Database) RunMigrationsWithOptions(ctx context.Context, fsys fs.FS, di
 				return err
 			}
 
-			insertSQL := fmt.Sprintf("INSERT INTO %s (version, checksum) VALUES ($1, $2)", tableName)
+			insertSQL := fmt.Sprintf("INSERT INTO %s (version, checksum) VALUES ($1, $2)", quotedTable)
 			if _, err := tx.Exec(ctx, insertSQL, version, fileChecksum); err != nil {
 				return err
 			}
@@ -334,6 +350,8 @@ func (db *Database) RollbackWithOptions(ctx context.Context, fsys fs.FS, dir str
 		}
 	}()
 
+	quotedTable := pgx.Identifier{tableName}.Sanitize()
+
 	// Verify that the migrations table exists before attempting to read applied records
 	var tableExists bool
 	checkTableSQL := `
@@ -342,12 +360,15 @@ func (db *Database) RollbackWithOptions(ctx context.Context, fsys fs.FS, dir str
 			WHERE table_name = lower($1) AND table_schema = current_schema()
 		);
 	`
-	if err := conn.QueryRow(ctx, checkTableSQL, tableName).Scan(&tableExists); err != nil || !tableExists {
+	if err := conn.QueryRow(ctx, checkTableSQL, tableName).Scan(&tableExists); err != nil {
+		return apperror.Wrap(apperror.CodeInternal, fmt.Sprintf("failed to check existence of migration history table %q", tableName), err)
+	}
+	if !tableExists {
 		return apperror.New(apperror.CodeNotFound, fmt.Sprintf("migration history table %q does not exist; cannot perform rollback", tableName))
 	}
 
 	// Query applied migrations in reverse of the defined migration order
-	querySQL := fmt.Sprintf(`SELECT version FROM %s ORDER BY version DESC LIMIT $1`, tableName)
+	querySQL := fmt.Sprintf(`SELECT version FROM %s ORDER BY version DESC LIMIT $1`, quotedTable)
 	rows, err := conn.Query(ctx, querySQL, steps)
 	if err != nil {
 		return apperror.Wrap(apperror.CodeInternal, fmt.Sprintf("failed to query applied schema migrations from %s", tableName), err)
@@ -391,7 +412,7 @@ func (db *Database) RollbackWithOptions(ctx context.Context, fsys fs.FS, dir str
 				return err
 			}
 
-			deleteSQL := fmt.Sprintf("DELETE FROM %s WHERE version = $1", tableName)
+			deleteSQL := fmt.Sprintf("DELETE FROM %s WHERE version = $1", quotedTable)
 			if _, err := tx.Exec(ctx, deleteSQL, version); err != nil {
 				return err
 			}

@@ -220,13 +220,20 @@ func (s *Service) HandleOperation(ctx context.Context) error {
 
         if err := s.doWork(txCtx, txDB); err != nil {
             // Write directly to pool so the audit record is preserved upon transaction rollback
-            _ = s.auditRepo.RecordFailure(context.Background(), s.db.Pool, "work_failed", err.Error())
+            auditCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+            defer cancel()
+            _ = s.auditRepo.RecordFailure(auditCtx, s.db.Pool, "work_failed", err.Error())
             return err // txCtx operations roll back
         }
         return nil
     })
 }
 ```
+
+> [!WARNING]
+> **Pool Saturation & Timeout Considerations**:
+> Writing out-of-band via `db.Pool` while inside an active transaction acquires a **second connection** from the pool.
+> If all connections in the pool are actively held by concurrent transactions, calling `db.Pool.Exec` will block until a connection becomes available or its context deadline expires. Always execute out-of-band writes with a detached, bounded timeout context (`context.WithTimeout`) and handle errors defensively so that audit failures cannot deadlock or delay outer transaction rollback cleanup.
 
 ---
 
@@ -247,4 +254,4 @@ go test -count=1 -v -race -run TestIntegration ./...
 
 ## License
 
-This project is licensed under the Apache 2.0 License.
+This project is licensed under the GNU Affero General Public License v3.0 (AGPLv3) matching the repository root LICENSE file.
