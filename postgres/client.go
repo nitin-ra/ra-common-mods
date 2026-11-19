@@ -2,9 +2,7 @@ package postgres
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -19,14 +17,6 @@ type Database struct {
 
 // Connect establishes a connection pool to PostgreSQL and returns a Database wrapper.
 func Connect(ctx context.Context, cfg Config, log *slog.Logger) (*Database, error) {
-	storageType := cfg.StorageType
-	if storageType == "" {
-		storageType = "postgresql"
-	}
-	if !strings.EqualFold(storageType, "postgresql") {
-		return nil, apperror.New(apperror.CodeInternal, fmt.Sprintf("unsupported storage type: %s", storageType))
-	}
-
 	dsn := BuildDSN(cfg)
 
 	poolConfig, err := pgxpool.ParseConfig(dsn)

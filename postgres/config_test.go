@@ -85,13 +85,12 @@ func TestBuildDSN_SpecialCharacters(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := postgres.Config{
-				StorageType: "postgresql",
-				Host:        tc.host,
-				Port:        tc.port,
-				Username:    tc.username,
-				Password:    tc.password,
-				Database:    tc.database,
-				SSLMode:     tc.sslmode,
+				Host:     tc.host,
+				Port:     tc.port,
+				Username: tc.username,
+				Password: tc.password,
+				Database: tc.database,
+				SSLMode:  tc.sslmode,
 			}
 
 			dsn := postgres.BuildDSN(cfg)
@@ -118,7 +117,6 @@ func TestBuildDSN_SpecialCharacters(t *testing.T) {
 
 func TestLoadConfig_Defaults(t *testing.T) {
 	// Clean ambient environment
-	t.Setenv("STORAGE_TYPE", "")
 	t.Setenv("HOST", "")
 	t.Setenv("PORT", "")
 	t.Setenv("USERNAME", "")

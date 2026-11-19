@@ -10,27 +10,6 @@ import (
 	"github.com/routerarchitects/ra-common-mods/postgres"
 )
 
-func TestConnect_UnsupportedStorageType(t *testing.T) {
-	cfg := postgres.Config{
-		StorageType: "mysql",
-		Host:        "localhost",
-		Port:        3306,
-	}
-
-	logger := slog.Default()
-	database, err := postgres.Connect(context.Background(), cfg, logger)
-	if err == nil {
-		if database != nil {
-			database.Close()
-		}
-		t.Fatal("expected error for unsupported storage type, got nil")
-	}
-
-	if !strings.Contains(err.Error(), "unsupported storage type: mysql") {
-		t.Fatalf("expected error message containing 'unsupported storage type: mysql', got: %v", err)
-	}
-}
-
 func TestDatabase_Ping_NilPool(t *testing.T) {
 	database := &postgres.Database{Pool: nil}
 	err := database.Ping(context.Background())
@@ -53,7 +32,6 @@ func TestDatabase_Close_NilPool(t *testing.T) {
 
 func TestConnect_UnreachableDatabase_Timeout(t *testing.T) {
 	cfg := postgres.Config{
-		StorageType:        "postgresql",
 		Host:               "127.0.0.1",
 		Port:               54329,
 		Username:           "postgres",
