@@ -20,6 +20,7 @@ import (
 var (
 	validTableNameRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 	validVersionRegex   = regexp.MustCompile(`^[0-9]+[a-zA-Z0-9_-]*$`)
+	leadingDigitsRegex  = regexp.MustCompile(`^([0-9]+)`)
 )
 
 // MigrationOptions configures the execution of database schema migrations.
@@ -48,6 +49,8 @@ func sanitizeTableName(table string) (string, error) {
 
 // RunMigrations automatically scans and applies forward SQL migrations (*.up.sql) from migrationsDir.
 // It acquires a PostgreSQL session-level advisory lock using advisoryLockKey to serialize migrations across concurrent instances.
+// Migration files must use consistent zero-padded numeric prefixes (e.g. 000001_core.up.sql) or fixed-width
+// timestamps to ensure correct lexicographical chronological execution.
 func (db *Database) RunMigrations(ctx context.Context, migrationsDir string, advisoryLockKey int64) error {
 	if _, err := os.Stat(migrationsDir); os.IsNotExist(err) {
 		return apperror.New(apperror.CodeNotFound, fmt.Sprintf("migrations directory %q does not exist", migrationsDir))
@@ -108,6 +111,21 @@ func (db *Database) RunMigrationsWithOptions(ctx context.Context, fsys fs.FS, di
 
 	if len(upFiles) == 0 {
 		return apperror.New(apperror.CodeInternal, fmt.Sprintf("no migration files (*.up.sql) found in directory '%s'", dir))
+	}
+
+	// Enforce that all migration version prefixes have consistent zero-padding (equal digit length)
+	// to ensure lexicographical sorting matches numerical chronological execution order.
+	var expectedDigitLen int
+	var firstPrefixFile string
+	for _, file := range upFiles {
+		version := strings.TrimSuffix(file, ".up.sql")
+		digits := leadingDigitsRegex.FindString(version)
+		if expectedDigitLen == 0 {
+			expectedDigitLen = len(digits)
+			firstPrefixFile = file
+		} else if len(digits) != expectedDigitLen {
+			return apperror.New(apperror.CodeInvalidInput, fmt.Sprintf("inconsistent migration version prefix length in %q (has %d digits, but %q has %d digits): all versions must use consistent zero-padded prefixes to ensure correct lexicographical ordering", file, len(digits), firstPrefixFile, expectedDigitLen))
+		}
 	}
 
 	// Verify that each .up.sql file has a matching .down.sql rollback script
@@ -352,12 +370,14 @@ func (db *Database) RollbackWithOptions(ctx context.Context, fsys fs.FS, dir str
 
 	quotedTable := pgx.Identifier{tableName}.Sanitize()
 
-	// Verify that the migrations table exists before attempting to read applied records
+	// Verify that the migrations table exists before attempting to read applied records.
+	// We preserve exact identifier casing ($1 without lower()) because tables created with quoted
+	// identifiers (pgx.Identifier.Sanitize) preserve case in information_schema.tables.
 	var tableExists bool
 	checkTableSQL := `
 		SELECT EXISTS (
 			SELECT 1 FROM information_schema.tables 
-			WHERE table_name = lower($1) AND table_schema = current_schema()
+			WHERE table_name = $1 AND table_schema = current_schema()
 		);
 	`
 	if err := conn.QueryRow(ctx, checkTableSQL, tableName).Scan(&tableExists); err != nil {

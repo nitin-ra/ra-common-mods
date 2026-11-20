@@ -423,3 +423,134 @@ func TestIntegration_ChecksumBackfillAndTamperDetection(t *testing.T) {
 		t.Fatalf("expected checksum mismatch error, got: %v", err)
 	}
 }
+
+func TestIntegration_Rollback_MixedCaseTableName(t *testing.T) {
+	db, cleanup := getIntegrationDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	lockKey := int64(0x494e544547303035)
+	mixedCaseTable := "App_MigrationHistory_Records"
+
+	opts := postgres.MigrationOptions{
+		TableName:       mixedCaseTable,
+		AdvisoryLockKey: lockKey,
+	}
+
+	migrations := fstest.MapFS{
+		"migrations/000001_sample.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE integ_mixed_case_test (id INT);"),
+		},
+		"migrations/000001_sample.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE integ_mixed_case_test;"),
+		},
+	}
+
+	// 1. Run migrations with mixed-case table name
+	if err := db.RunMigrationsWithOptions(ctx, migrations, "migrations", opts); err != nil {
+		t.Fatalf("failed to run migrations with mixed-case table: %v", err)
+	}
+
+	// 2. Rollback with same mixed-case table name
+	// This tests that information_schema existence check preserves exact casing and does not fail
+	if err := db.RollbackWithOptions(ctx, migrations, "migrations", 1, opts); err != nil {
+		t.Fatalf("failed to rollback migration with mixed-case table: %v", err)
+	}
+
+	// 3. Rollback with non-existent mixed-case table name must return CodeNotFound
+	nonExistentOpts := postgres.MigrationOptions{
+		TableName:       "NonExistent_MigrationTable",
+		AdvisoryLockKey: lockKey,
+	}
+	err := db.RollbackWithOptions(ctx, migrations, "migrations", 1, nonExistentOpts)
+	if err == nil || !strings.Contains(err.Error(), "does not exist; cannot perform rollback") {
+		t.Fatalf("expected CodeNotFound for non-existent table, got: %v", err)
+	}
+}
+
+func TestIntegration_MigrationWithPLpgSQLFunctionsAndSemicolons(t *testing.T) {
+	db, cleanup := getIntegrationDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	lockKey := int64(0x494e544547303036)
+	tableName := "integ_function_migrations"
+
+	opts := postgres.MigrationOptions{
+		TableName:       tableName,
+		AdvisoryLockKey: lockKey,
+	}
+
+	migrations := fstest.MapFS{
+		"migrations/000001_create_fn_and_trigger.up.sql": &fstest.MapFile{
+			Data: []byte(`
+				CREATE TABLE integ_audit_items (
+					id SERIAL PRIMARY KEY,
+					name VARCHAR(100) NOT NULL,
+					counter INT NOT NULL DEFAULT 0,
+					updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+				);
+
+				-- PL/pgSQL function containing internal semicolons and logic blocks
+				CREATE OR REPLACE FUNCTION integ_update_audit_items()
+				RETURNS TRIGGER AS $$
+				DECLARE
+					v_threshold INT := 10;
+				BEGIN
+					IF NEW.counter > v_threshold THEN
+						NEW.name = NEW.name || '_elevated';
+					END IF;
+					NEW.updated_at = CURRENT_TIMESTAMP;
+					RETURN NEW;
+				END;
+				$$ LANGUAGE plpgsql;
+
+				CREATE TRIGGER trg_integ_update_audit_items
+				BEFORE UPDATE ON integ_audit_items
+				FOR EACH ROW
+				EXECUTE FUNCTION integ_update_audit_items();
+			`),
+		},
+		"migrations/000001_create_fn_and_trigger.down.sql": &fstest.MapFile{
+			Data: []byte(`
+				DROP TRIGGER IF EXISTS trg_integ_update_audit_items ON integ_audit_items;
+				DROP FUNCTION IF EXISTS integ_update_audit_items();
+				DROP TABLE IF EXISTS integ_audit_items;
+			`),
+		},
+	}
+
+	// 1. Run migrations containing PL/pgSQL function and trigger
+	if err := db.RunMigrationsWithOptions(ctx, migrations, "migrations", opts); err != nil {
+		t.Fatalf("failed to apply migration with PL/pgSQL function: %v", err)
+	}
+
+	// 2. Insert and update row to trigger the function
+	var itemID int
+	if err := db.Pool.QueryRow(ctx, "INSERT INTO integ_audit_items (name, counter) VALUES ($1, $2) RETURNING id", "item1", 5).Scan(&itemID); err != nil {
+		t.Fatalf("failed to insert test item: %v", err)
+	}
+
+	if _, err := db.Pool.Exec(ctx, "UPDATE integ_audit_items SET counter = 15 WHERE id = $1", itemID); err != nil {
+		t.Fatalf("failed to update test item: %v", err)
+	}
+
+	var updatedName string
+	if err := db.Pool.QueryRow(ctx, "SELECT name FROM integ_audit_items WHERE id = $1", itemID).Scan(&updatedName); err != nil {
+		t.Fatalf("failed to query updated item: %v", err)
+	}
+	if updatedName != "item1_elevated" {
+		t.Fatalf("expected trigger to set name to 'item1_elevated', got %q", updatedName)
+	}
+
+	// 3. Rollback the migration
+	if err := db.RollbackWithOptions(ctx, migrations, "migrations", 1, opts); err != nil {
+		t.Fatalf("failed to roll back migration with PL/pgSQL function: %v", err)
+	}
+
+	// 4. Verify table and function were dropped
+	var tableCount int
+	if err := db.Pool.QueryRow(ctx, "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'integ_audit_items'").Scan(&tableCount); err != nil || tableCount != 0 {
+		t.Fatalf("expected integ_audit_items table to be dropped, count=%d", tableCount)
+	}
+}

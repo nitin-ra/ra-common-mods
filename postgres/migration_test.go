@@ -72,6 +72,30 @@ func TestMigration_InvalidVersionFormat(t *testing.T) {
 	}
 }
 
+func TestMigration_InconsistentPrefixLengthRejection(t *testing.T) {
+	database := &postgres.Database{Pool: nil}
+
+	mapFS := fstest.MapFS{
+		"migrations/000001_first.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE items (id INT);"),
+		},
+		"migrations/000001_first.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE items;"),
+		},
+		"migrations/2_second.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE orders (id INT);"),
+		},
+		"migrations/2_second.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE orders;"),
+		},
+	}
+
+	err := database.RunMigrationsFS(context.Background(), mapFS, "migrations", testAdvisoryLockKey)
+	if err == nil || !strings.Contains(err.Error(), "inconsistent migration version prefix length") {
+		t.Fatalf("expected inconsistent prefix length error, got: %v", err)
+	}
+}
+
 func TestMigration_ConfiguredTableName(t *testing.T) {
 	// Verify that a Database initialized with custom MigrationsTable uses it
 	db := &postgres.Database{

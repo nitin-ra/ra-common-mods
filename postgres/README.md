@@ -94,14 +94,27 @@ type Config struct {
 ## Schema Migrations
 
 ### Migration File Convention
-Migration files must follow lexicographical numbering with paired `.up.sql` and `.down.sql` scripts:
-```text
-db/migrations/
-├── 000001_initial_schema.up.sql
-├── 000001_initial_schema.down.sql
-├── 000002_add_indexes.up.sql
-└── 000002_add_indexes.down.sql
-```
+Migration files are discovered and executed in lexicographical order (`sort.Strings`). To ensure that migrations execute in correct numerical and chronological order, version prefixes **must** use consistent zero-padding across all files in the migration directory:
+
+- **6-digit zero-padding (recommended)**:
+  ```text
+  db/migrations/
+  ├── 000001_initial_schema.up.sql
+  ├── 000001_initial_schema.down.sql
+  ├── 000002_add_indexes.up.sql
+  └── 000002_add_indexes.down.sql
+  ```
+- **14-digit UTC timestamps (`YYYYMMDDHHMMSS`)**:
+  ```text
+  db/migrations/
+  ├── 20261120120000_core_schema.up.sql
+  ├── 20261120120000_core_schema.down.sql
+  ├── 20261120120100_add_indexes.up.sql
+  └── 20261120120100_add_indexes.down.sql
+  ```
+
+> [!IMPORTANT]
+> Unpadded version prefixes (such as `1_`, `2_`, ..., `10_`) will sort incorrectly under standard string sorting (`10_` sorts before `2_`). `RunMigrationsWithOptions` validates that all migration files share an identical digit prefix length and rejects inconsistent prefix lengths with `CodeInvalidInput`.
 
 ### Running Migrations from Filesystem Path
 `RunMigrations` automatically respects the table name configured in `Config.MigrationsTable` (defaulting to `schema_migrations`):
@@ -222,7 +235,9 @@ func (s *Service) HandleOperation(ctx context.Context) error {
             // Write directly to pool so the audit record is preserved upon transaction rollback
             auditCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
             defer cancel()
-            _ = s.auditRepo.RecordFailure(auditCtx, s.db.Pool, "work_failed", err.Error())
+            if auditErr := s.auditRepo.RecordFailure(auditCtx, s.db.Pool, "work_failed", err.Error()); auditErr != nil {
+                s.log.ErrorContext(ctx, "failed to record out-of-band audit failure", "error", auditErr)
+            }
             return err // txCtx operations roll back
         }
         return nil
