@@ -89,6 +89,19 @@ type Config struct {
 }
 ```
 
+### 3. TLS Transport & SSL Mode Configuration
+
+All database connections support configurable `SSLMode` via environment variables (e.g., `STORAGE_TYPE_POSTGRESQL_SSLMODE`). Supported modes are `disable`, `allow`, `prefer`, `require`, `verify-ca`, and `verify-full`.
+
+- **Default policy (`SSLMODE=require`)**:
+  OpenWiFi microservices are deployed inside isolated private cloud VPCs and container overlay networks. Defaulting to `require` ensures all network traffic and credentials are encrypted in transit, preventing passive eavesdropping.
+  > [!NOTE]
+  > Under PostgreSQL/pgx driver conventions, `require` provides transport encryption without verifying server certificate identity or hostname matching against a CA.
+- **Server Identity Verification (`SSLMODE=verify-full`)**:
+  In zero-trust architectures or environments traversing untrusted networks where server spoofing or man-in-the-middle attacks must be actively mitigated, configure `SSLMODE=verify-full`. When `verify-full` is specified, configure root certificates via standard PostgreSQL client environment variables (`PGSSLROOTCERT=/path/to/ca.crt`) or the system trust store to enforce full certificate chain and hostname verification.
+- **Local Development (`SSLMODE=disable`)**:
+  For unencrypted local development containers or unit tests, explicitly set `STORAGE_TYPE_POSTGRESQL_SSLMODE=disable`.
+
 ---
 
 ## Schema Migrations
@@ -154,6 +167,17 @@ if err := db.Rollback(ctx, cfg.MigrationsDir, 2, ServiceMigrationLockKey); err !
 }
 ```
 
+### Migration Atomicity & Transaction Control Contract
+
+Every `.up.sql` and `.down.sql` script is executed within an atomic PostgreSQL transaction managed exclusively by the migration runner (`pgx.BeginFunc`).
+
+> [!IMPORTANT]
+> **No Manual Transaction Control in Migration Files**:
+> Migration files **must NOT contain top-level `BEGIN`, `COMMIT`, or `ROLLBACK` statements**.
+> Issuing manual transaction control commands inside `.up.sql` or `.down.sql` prematurely closes or aborts the runner's transaction block, decoupling DDL execution from the insertion of the `schema_migrations` tracking record and breaking migration atomicity.
+>
+> *Note on Enforcement*: This is a documented architectural contract. The runner intentionally avoids client-side SQL regex parsing to avoid falsely rejecting valid transaction keywords appearing inside PL/pgSQL function bodies (e.g. `BEGIN ... END;`), stored procedures, SQL comments, or string literals. Migration authors must adhere to this contract.
+
 ---
 
 ## Transaction Toolkit
@@ -208,8 +232,9 @@ func (s *Service) TransferFunds(ctx context.Context, from, to string, amount int
 
 #### Transaction Semantics & Isolation Rules
 - **Same-Database Nesting**: If a function invokes `WithinTx` inside an existing transaction for the same database, it participates directly in the outer transaction without SAVEPOINT overhead.
+- **Nested Error Propagation Contract**: Because nested `WithinTx` calls participate directly in the parent transaction without SAVEPOINTs, any business or operational failure in a nested function that requires transaction rollback **must be propagated back to the outer transaction owner** (the root `WithinTx` or `WithTx` caller). If an outer callback intercepts/swallows a Go business error from a nested function and returns `nil`, the outer transaction will commit all preceding writes (provided PostgreSQL did not enter an aborted state). To ensure atomic rollback across nested scopes, always propagate errors upward to the outer transaction boundary.
 - **Aborted State Behavior**: Because nested calls participate directly in the parent transaction, any statement failure leaves the PostgreSQL transaction in an aborted state (`SQLSTATE 25P02`). Catching or ignoring the Go error in a nested function will not recover the transaction; the entire transaction must be rolled back by the outer transaction owner.
-- **Single-DB Scope & 2PC**: This module currently supports single-database transactions. If `dbB.WithinTx` or `dbB.DB` is called with a context carrying an active transaction from `dbA`, it immediately aborts with a conflict error. Distributed two-phase commit (2PC) across multiple databases can be implemented in a future release if required.
+- **Single-DB Scope & 2PC**: This module currently supports single-database transactions. If `dbB.WithinTx` or `dbB.DB` is called with a context carrying an active transaction from `dbA`, it immediately aborts with a conflict error. If multiple database transactions are injected into a context, all access via `DB()` or `WithinTx()` is rejected to prevent uncoordinated operations. Distributed two-phase commit (2PC) across multiple databases can be implemented in a future release if required.
 - **Incompatible Options**: Specifying `pgx.TxOptions` (`IsoLevel`, `AccessMode`, or `DeferrableMode`) inside an existing transaction returns a descriptive conflict error.
 
 ### 4. Retry on Serialization & Deadlock (`WithRetryTx`)

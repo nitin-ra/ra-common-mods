@@ -554,3 +554,71 @@ func TestIntegration_MigrationWithPLpgSQLFunctionsAndSemicolons(t *testing.T) {
 		t.Fatalf("expected integ_audit_items table to be dropped, count=%d", tableCount)
 	}
 }
+
+func TestIntegration_Connect_Lifecycle(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("TEST_POSTGRES_DSN"))
+	if dsn == "" {
+		dsn = strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	}
+	if dsn == "" {
+		t.Skip("skipping PostgreSQL integration test: set TEST_POSTGRES_DSN or DATABASE_URL to enable")
+	}
+
+	poolConfig, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("failed to parse configured TEST_POSTGRES_DSN: %v", err)
+	}
+
+	sslMode := poolConfig.ConnConfig.RuntimeParams["sslmode"]
+	if sslMode == "" {
+		sslMode = "disable"
+	}
+
+	cfg := postgres.Config{
+		Host:               poolConfig.ConnConfig.Host,
+		Port:               int(poolConfig.ConnConfig.Port),
+		Username:           poolConfig.ConnConfig.User,
+		Password:           poolConfig.ConnConfig.Password,
+		Database:           poolConfig.ConnConfig.Database,
+		SSLMode:            sslMode,
+		MaxConns:           12,
+		MinConns:           3,
+		MaxConnLifetime:    20 * time.Minute,
+		MaxConnIdleTime:    5 * time.Minute,
+		HealthCheckTimeout: 3 * time.Second,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 1. Test successful Connect()
+	db, err := postgres.Connect(ctx, cfg, nil)
+	if err != nil {
+		t.Fatalf("postgres.Connect failed: %v", err)
+	}
+
+	// 2. Verify pool was initialized and configured with custom limits
+	if db.Pool == nil {
+		t.Fatal("expected non-nil db.Pool after Connect")
+	}
+	stat := db.Pool.Stat()
+	if stat.MaxConns() != 12 {
+		t.Fatalf("expected MaxConns=12, got %d", stat.MaxConns())
+	}
+	if db.Config().MaxConns != 12 || db.Config().MinConns != 3 {
+		t.Fatalf("expected stored Config MaxConns=12/MinConns=3, got %d/%d", db.Config().MaxConns, db.Config().MinConns)
+	}
+
+	// 3. Verify Ping() succeeds against active pool
+	if err := db.Ping(ctx); err != nil {
+		t.Fatalf("db.Ping failed on active database: %v", err)
+	}
+
+	// 4. Test Close() and subsequent operations
+	db.Close()
+
+	// After Close(), Ping should report pool closed or error
+	if err := db.Ping(ctx); err == nil {
+		t.Fatal("expected Ping to fail after Close(), got nil")
+	}
+}

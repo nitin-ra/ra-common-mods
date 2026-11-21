@@ -148,6 +148,85 @@ func TestTx_MultiDatabase_Isolation(t *testing.T) {
 	}
 }
 
+func TestTx_MultiDatabase_MultipleInjectionsRejected(t *testing.T) {
+	dbA := &postgres.Database{Pool: nil}
+	dbB := &postgres.Database{Pool: nil}
+
+	ctx := context.Background()
+	mockA := &mockTx{}
+	mockB := &mockTx{}
+
+	// Inject dbA then dbB into the same context to simulate uncoordinated multi-DB injection
+	txCtx := postgres.ContextWithTx(ctx, dbA, mockA)
+	txCtx = postgres.ContextWithTx(txCtx, dbB, mockB)
+
+	// Neither dbA nor dbB should return a valid tx from the contaminated context
+	if tx, ok := dbA.TxFromContext(txCtx); ok || tx != nil {
+		t.Fatalf("expected dbA.TxFromContext to return false on contaminated multi-DB context, got ok=%v, tx=%v", ok, tx)
+	}
+	if tx, ok := dbB.TxFromContext(txCtx); ok || tx != nil {
+		t.Fatalf("expected dbB.TxFromContext to return false on contaminated multi-DB context, got ok=%v, tx=%v", ok, tx)
+	}
+
+	// dbA.DB and dbB.DB must both reject with conflict error
+	if _, err := dbA.DB(txCtx); err == nil || !strings.Contains(err.Error(), "multiple database instances") {
+		t.Fatalf("expected dbA.DB to reject contaminated multi-DB context, got err=%v", err)
+	}
+	if _, err := dbB.DB(txCtx); err == nil || !strings.Contains(err.Error(), "multiple database instances") {
+		t.Fatalf("expected dbB.DB to reject contaminated multi-DB context, got err=%v", err)
+	}
+
+	// dbA.WithinTx and dbB.WithinTx must both reject without executing callbacks
+	fnExecuted := false
+	if err := dbA.WithinTx(txCtx, func(c context.Context) error {
+		fnExecuted = true
+		return nil
+	}); err == nil || !strings.Contains(err.Error(), "multiple database instances") {
+		t.Fatalf("expected dbA.WithinTx to reject contaminated context, got err=%v", err)
+	}
+	if fnExecuted {
+		t.Fatal("expected callback NOT to execute on contaminated context for dbA")
+	}
+
+	if err := dbB.WithinTx(txCtx, func(c context.Context) error {
+		fnExecuted = true
+		return nil
+	}); err == nil || !strings.Contains(err.Error(), "multiple database instances") {
+		t.Fatalf("expected dbB.WithinTx to reject contaminated context, got err=%v", err)
+	}
+	if fnExecuted {
+		t.Fatal("expected callback NOT to execute on contaminated context for dbB")
+	}
+}
+
+func TestTx_NestedTransaction_ErrorPropagation(t *testing.T) {
+	db := &postgres.Database{Pool: nil}
+	ctx := context.Background()
+	mock := &mockTx{}
+
+	txCtx := postgres.ContextWithTx(ctx, db, mock)
+
+	expectedErr := errors.New("business rule failed in nested function")
+
+	// Outer WithinTx participates with existing mock tx; inner function returns error
+	err := db.WithinTx(txCtx, func(nestedCtx1 context.Context) error {
+		// Call nested WithinTx simulating a sub-service call
+		nestedErr := db.WithinTx(nestedCtx1, func(nestedCtx2 context.Context) error {
+			// Sub-operation performs work then returns a business error
+			return expectedErr
+		})
+		if nestedErr != nil {
+			// Propagate error to outer transaction owner to ensure atomic rollback
+			return nestedErr
+		}
+		return nil
+	})
+
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("expected outer WithinTx to propagate nested error %v, got %v", expectedErr, err)
+	}
+}
+
 func TestTx_WithinTx_IncompatibleOptionsRejection(t *testing.T) {
 	db := &postgres.Database{Pool: nil}
 	mock := &mockTx{}

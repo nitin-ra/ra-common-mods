@@ -96,6 +96,30 @@ func TestMigration_InconsistentPrefixLengthRejection(t *testing.T) {
 	}
 }
 
+func TestMigration_DuplicateNumericPrefixRejection(t *testing.T) {
+	database := &postgres.Database{Pool: nil}
+
+	mapFS := fstest.MapFS{
+		"migrations/000001_users.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE users (id INT);"),
+		},
+		"migrations/000001_users.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE users;"),
+		},
+		"migrations/000001_orders.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE orders (id INT);"),
+		},
+		"migrations/000001_orders.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE orders;"),
+		},
+	}
+
+	err := database.RunMigrationsFS(context.Background(), mapFS, "migrations", testAdvisoryLockKey)
+	if err == nil || !strings.Contains(err.Error(), "duplicate migration version prefix") {
+		t.Fatalf("expected duplicate version prefix error, got: %v", err)
+	}
+}
+
 func TestMigration_ConfiguredTableName(t *testing.T) {
 	// Verify that a Database initialized with custom MigrationsTable uses it
 	db := &postgres.Database{

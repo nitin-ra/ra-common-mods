@@ -51,6 +51,8 @@ func sanitizeTableName(table string) (string, error) {
 // It acquires a PostgreSQL session-level advisory lock using advisoryLockKey to serialize migrations across concurrent instances.
 // Migration files must use consistent zero-padded numeric prefixes (e.g. 000001_core.up.sql) or fixed-width
 // timestamps to ensure correct lexicographical chronological execution.
+// Contract: migration files must not contain top-level BEGIN, COMMIT, or ROLLBACK statements; transaction boundaries
+// are managed exclusively by the migration runner to ensure atomic schema and tracking history updates.
 func (db *Database) RunMigrations(ctx context.Context, migrationsDir string, advisoryLockKey int64) error {
 	if _, err := os.Stat(migrationsDir); os.IsNotExist(err) {
 		return apperror.New(apperror.CodeNotFound, fmt.Sprintf("migrations directory %q does not exist", migrationsDir))
@@ -95,17 +97,26 @@ func (db *Database) RunMigrationsWithOptions(ctx context.Context, fsys fs.FS, di
 
 	var upFiles []string
 	upFileMap := make(map[string]bool)
+	numericPrefixMap := make(map[string]string)
 	for _, entry := range entries {
 		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".up.sql") {
 			version := strings.TrimSuffix(entry.Name(), ".up.sql")
 			if !validVersionRegex.MatchString(version) {
 				return apperror.New(apperror.CodeInvalidInput, fmt.Sprintf("invalid migration version %q in file %q: must start with numbers and contain only alphanumeric, underscore, or dash characters", version, entry.Name()))
 			}
-			upFiles = append(upFiles, entry.Name())
 			if upFileMap[version] {
 				return apperror.New(apperror.CodeConflict, fmt.Sprintf("duplicate migration version detected: %s", version))
 			}
 			upFileMap[version] = true
+
+			// Validate numeric prefix uniqueness (e.g. reject 000001_users and 000001_orders)
+			numericPrefix := leadingDigitsRegex.FindString(version)
+			if prevFile, exists := numericPrefixMap[numericPrefix]; exists {
+				return apperror.New(apperror.CodeConflict, fmt.Sprintf("duplicate migration version prefix %q detected in %q (previously declared in %q); numeric prefixes must be uniquely numbered", numericPrefix, entry.Name(), prevFile))
+			}
+			numericPrefixMap[numericPrefix] = entry.Name()
+
+			upFiles = append(upFiles, entry.Name())
 		}
 	}
 

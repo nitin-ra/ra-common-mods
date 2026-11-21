@@ -38,9 +38,14 @@ func ContextWithTx(ctx context.Context, db *Database, tx pgx.Tx) context.Context
 }
 
 // TxFromContext retrieves an active pgx.Tx transaction handle from context associated with this database instance.
-// Returns false if no transaction is active for this database.
+// Returns false if no transaction is active for this database or if the context has been contaminated with
+// transactions belonging to multiple database instances.
 func (db *Database) TxFromContext(ctx context.Context) (pgx.Tx, bool) {
 	if ctx == nil || db == nil {
+		return nil, false
+	}
+	// If context has multiple database transactions injected, single-database transaction isolation is violated
+	if activeDBs, ok := ctx.Value(activeTxDatabasesKey{}).(map[*Database]struct{}); ok && len(activeDBs) > 1 {
 		return nil, false
 	}
 	tx, ok := ctx.Value(txContextKey{db: db}).(pgx.Tx)
@@ -49,26 +54,29 @@ func (db *Database) TxFromContext(ctx context.Context) (pgx.Tx, bool) {
 
 // DB returns the active pgx.Tx from ctx if one is present for this database instance;
 // otherwise it returns db.Pool.
-// If the context contains active transactions belonging to other database instances, but none for db,
+// If the context contains active transactions belonging to other database instances, or multiple databases,
 // it returns an explicit error to prevent accidental cross-database or non-transactional fallback execution.
 func (db *Database) DB(ctx context.Context) (DBTX, error) {
 	if db == nil {
 		return nil, apperror.New(apperror.CodeInternal, "database instance is nil")
 	}
 
-	if tx, ok := db.TxFromContext(ctx); ok {
-		return tx, nil
-	}
-
 	// Guard against cross-database transaction contamination:
-	// If ctx contains active transactions for other database instances, but none for db,
-	// reject to prevent accidental non-transactional fallback on this pool.
+	// If ctx contains active transactions for other database instances, or multiple database instances,
+	// reject to prevent accidental non-transactional fallback or uncoordinated cross-database transaction execution.
 	if ctx != nil {
 		if activeDBs, ok := ctx.Value(activeTxDatabasesKey{}).(map[*Database]struct{}); ok && len(activeDBs) > 0 {
+			if len(activeDBs) > 1 {
+				return nil, apperror.New(apperror.CodeConflict, "cross-database transaction conflict: context contains transactions for multiple database instances")
+			}
 			if _, hasSelf := activeDBs[db]; !hasSelf {
 				return nil, apperror.New(apperror.CodeConflict, "context contains a transaction belonging to a different database instance")
 			}
 		}
+	}
+
+	if tx, ok := db.TxFromContext(ctx); ok {
+		return tx, nil
 	}
 
 	if db.Pool == nil {
@@ -166,10 +174,13 @@ func (db *Database) WithinTxOptions(ctx context.Context, opts pgx.TxOptions, fn 
 	}
 
 	// 1. Guard against cross-database transaction contamination:
-	// If context carries an active transaction for another database, abort immediately.
+	// If context carries an active transaction for another database or multiple databases, abort immediately.
 	// This module currently supports single-database transactions only (no distributed 2PC).
 	if ctx != nil {
 		if activeDBs, ok := ctx.Value(activeTxDatabasesKey{}).(map[*Database]struct{}); ok && len(activeDBs) > 0 {
+			if len(activeDBs) > 1 {
+				return apperror.New(apperror.CodeConflict, "cross-database transaction conflict: context contains transactions for multiple database instances; distributed transactions (2PC) are not supported")
+			}
 			if _, hasSelf := activeDBs[db]; !hasSelf {
 				return apperror.New(apperror.CodeConflict, "cross-database transaction detected: context already has an active transaction for another database; distributed transactions (2PC) are not supported")
 			}
