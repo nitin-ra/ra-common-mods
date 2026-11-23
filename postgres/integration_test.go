@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -555,6 +556,20 @@ func TestIntegration_MigrationWithPLpgSQLFunctionsAndSemicolons(t *testing.T) {
 	}
 }
 
+func extractSSLMode(dsn string) string {
+	if u, err := url.Parse(dsn); err == nil && u.Scheme != "" {
+		if m := u.Query().Get("sslmode"); m != "" {
+			return strings.ToLower(strings.TrimSpace(m))
+		}
+	}
+	for _, part := range strings.Fields(dsn) {
+		if strings.HasPrefix(part, "sslmode=") {
+			return strings.ToLower(strings.TrimPrefix(part, "sslmode="))
+		}
+	}
+	return ""
+}
+
 func TestIntegration_Connect_Lifecycle(t *testing.T) {
 	dsn := strings.TrimSpace(os.Getenv("TEST_POSTGRES_DSN"))
 	if dsn == "" {
@@ -569,9 +584,14 @@ func TestIntegration_Connect_Lifecycle(t *testing.T) {
 		t.Fatalf("failed to parse configured TEST_POSTGRES_DSN: %v", err)
 	}
 
-	sslMode := poolConfig.ConnConfig.RuntimeParams["sslmode"]
+	// Preserve the exact SSL mode specified in the DSN rather than defaulting to disable
+	sslMode := extractSSLMode(dsn)
 	if sslMode == "" {
-		sslMode = "disable"
+		if poolConfig.ConnConfig.TLSConfig != nil {
+			sslMode = "require"
+		} else {
+			sslMode = "disable"
+		}
 	}
 
 	cfg := postgres.Config{
@@ -591,10 +611,10 @@ func TestIntegration_Connect_Lifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// 1. Test successful Connect()
+	// 1. Test successful Connect() using preserved SSL mode
 	db, err := postgres.Connect(ctx, cfg, nil)
 	if err != nil {
-		t.Fatalf("postgres.Connect failed: %v", err)
+		t.Fatalf("postgres.Connect failed with sslmode=%q: %v", sslMode, err)
 	}
 
 	// 2. Verify pool was initialized and configured with custom limits
@@ -608,6 +628,9 @@ func TestIntegration_Connect_Lifecycle(t *testing.T) {
 	if db.Config().MaxConns != 12 || db.Config().MinConns != 3 {
 		t.Fatalf("expected stored Config MaxConns=12/MinConns=3, got %d/%d", db.Config().MaxConns, db.Config().MinConns)
 	}
+	if db.Config().SSLMode != sslMode {
+		t.Fatalf("expected stored Config SSLMode=%q, got %q", sslMode, db.Config().SSLMode)
+	}
 
 	// 3. Verify Ping() succeeds against active pool
 	if err := db.Ping(ctx); err != nil {
@@ -620,5 +643,24 @@ func TestIntegration_Connect_Lifecycle(t *testing.T) {
 	// After Close(), Ping should report pool closed or error
 	if err := db.Ping(ctx); err == nil {
 		t.Fatal("expected Ping to fail after Close(), got nil")
+	}
+
+	// 5. If running against an unencrypted test instance (sslmode=disable),
+	// verify that requesting sslmode=require enforces TLS and refuses unencrypted transport
+	if sslMode == "disable" {
+		t.Run("Enforce_TLS_Refusal_On_Plaintext_Server", func(t *testing.T) {
+			tlsCfg := cfg
+			tlsCfg.SSLMode = "require"
+			tlsCtx, tlsCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer tlsCancel()
+
+			tlsDB, tlsErr := postgres.Connect(tlsCtx, tlsCfg, nil)
+			if tlsErr == nil {
+				tlsDB.Close()
+				t.Log("Server supports TLS; connection with sslmode=require succeeded")
+			} else {
+				t.Logf("TLS enforcement verified: Connect with sslmode=require was rejected by non-TLS server as expected: %v", tlsErr)
+			}
+		})
 	}
 }

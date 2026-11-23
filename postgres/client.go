@@ -86,11 +86,19 @@ func Connect(ctx context.Context, cfg Config, log *slog.Logger) (*Database, erro
 
 	log.InfoContext(ctx, "successfully connected to postgresql database")
 
+	return NewDatabase(pool, cfg, log), nil
+}
+
+// NewDatabase constructs a Database wrapper around an existing pgxpool.Pool, configuration, and optional logger.
+func NewDatabase(pool *pgxpool.Pool, cfg Config, log *slog.Logger) *Database {
+	if log == nil {
+		log = slog.Default()
+	}
 	return &Database{
 		Pool: pool,
 		log:  log,
 		cfg:  cfg,
-	}, nil
+	}
 }
 
 // Ping verifies database connectivity within the provided context.

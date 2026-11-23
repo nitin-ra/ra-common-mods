@@ -249,11 +249,21 @@ func TestTx_WithinTx_IncompatibleOptionsRejection(t *testing.T) {
 			opts: pgx.TxOptions{DeferrableMode: pgx.Deferrable},
 		},
 		{
+			name: "Incompatible BeginQuery",
+			opts: pgx.TxOptions{BeginQuery: "BEGIN TRANSACTION READ ONLY"},
+		},
+		{
+			name: "Incompatible CommitQuery",
+			opts: pgx.TxOptions{CommitQuery: "COMMIT AND CHAIN"},
+		},
+		{
 			name: "All incompatible options combined",
 			opts: pgx.TxOptions{
 				IsoLevel:       pgx.RepeatableRead,
 				AccessMode:     pgx.ReadOnly,
 				DeferrableMode: pgx.Deferrable,
+				BeginQuery:     "BEGIN ISOLATION LEVEL REPEATABLE READ",
+				CommitQuery:    "COMMIT",
 			},
 		},
 	}
@@ -333,5 +343,62 @@ func TestTx_WithRetryTx_ContextCancelled(t *testing.T) {
 	}
 	if !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "database pool is not initialized") {
 		t.Fatalf("expected context.Canceled or pool error, got: %v", err)
+	}
+}
+
+func TestTx_WithTx_ActiveTransactionContextRejection(t *testing.T) {
+	dbA := &postgres.Database{Pool: nil}
+	dbB := &postgres.Database{Pool: nil}
+	mockA := &mockTx{}
+
+	// Inject active transaction for dbA into context
+	txCtxA := postgres.ContextWithTx(context.Background(), dbA, mockA)
+
+	// 1. dbA.WithTx on txCtxA must reject because context already has active tx for dbA
+	executed := false
+	err := dbA.WithTx(txCtxA, func(tx pgx.Tx) error {
+		executed = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected dbA.WithTx to reject context with existing tx on dbA, got nil")
+	}
+	if !strings.Contains(err.Error(), "already contains an active transaction for this database") {
+		t.Fatalf("expected active transaction conflict error, got: %v", err)
+	}
+	if executed {
+		t.Fatal("expected callback NOT to execute when context already has active tx")
+	}
+
+	// 2. dbA.WithTxOptions on txCtxA must also reject
+	executed = false
+	err = dbA.WithTxOptions(txCtxA, pgx.TxOptions{IsoLevel: pgx.Serializable}, func(tx pgx.Tx) error {
+		executed = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected dbA.WithTxOptions to reject context with existing tx on dbA, got nil")
+	}
+	if !strings.Contains(err.Error(), "already contains an active transaction for this database") {
+		t.Fatalf("expected active transaction conflict error, got: %v", err)
+	}
+	if executed {
+		t.Fatal("expected callback NOT to execute when context already has active tx")
+	}
+
+	// 3. dbB.WithTx on txCtxA must reject because context already has active tx for dbA (cross-DB isolation)
+	executed = false
+	err = dbB.WithTx(txCtxA, func(tx pgx.Tx) error {
+		executed = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected dbB.WithTx to reject context with active tx from dbA, got nil")
+	}
+	if !strings.Contains(err.Error(), "already contains an active transaction for a different database") {
+		t.Fatalf("expected cross-database active transaction conflict error, got: %v", err)
+	}
+	if executed {
+		t.Fatal("expected callback NOT to execute when context has active tx from different db")
 	}
 }

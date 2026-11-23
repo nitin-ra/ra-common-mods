@@ -149,6 +149,62 @@ func TestMigration_ConfiguredTableName(t *testing.T) {
 	}
 }
 
+func TestMigration_OptionsTableName_FallbackToDatabaseConfig(t *testing.T) {
+	mapFS := fstest.MapFS{
+		"migrations/000001_init.up.sql": &fstest.MapFile{
+			Data: []byte("CREATE TABLE items (id INT);"),
+		},
+		"migrations/000001_init.down.sql": &fstest.MapFile{
+			Data: []byte("DROP TABLE items;"),
+		},
+	}
+
+	// 1. When db has configured MigrationsTable, empty options.TableName should fall back to it
+	dbCustom := postgres.NewDatabase(nil, postgres.Config{MigrationsTable: "fms_schema_migrations"}, nil)
+	if dbCustom.Config().MigrationsTable != "fms_schema_migrations" {
+		t.Fatalf("expected MigrationsTable to be fms_schema_migrations, got: %s", dbCustom.Config().MigrationsTable)
+	}
+
+	optsEmpty := postgres.MigrationOptions{
+		TableName:       "", // empty: should fall back to db.Config().MigrationsTable
+		AdvisoryLockKey: testAdvisoryLockKey,
+	}
+
+	// RunMigrationsWithOptions should resolve to fms_schema_migrations and reach nil pool check without error
+	err := dbCustom.RunMigrationsWithOptions(context.Background(), mapFS, "migrations", optsEmpty)
+	if err == nil || !strings.Contains(err.Error(), "database pool is not initialized") {
+		t.Fatalf("expected nil pool error after resolving configured table name, got: %v", err)
+	}
+
+	// RollbackWithOptions should also resolve to fms_schema_migrations and reach nil pool check
+	err = dbCustom.RollbackWithOptions(context.Background(), mapFS, "migrations", 1, optsEmpty)
+	if err == nil || !strings.Contains(err.Error(), "database pool is not initialized") {
+		t.Fatalf("expected nil pool error after resolving configured table name on rollback, got: %v", err)
+	}
+
+	// 2. When db has an invalid configured MigrationsTable, empty options.TableName should fail validation
+	dbInvalid := postgres.NewDatabase(nil, postgres.Config{MigrationsTable: "invalid table name with spaces;"}, nil)
+	err = dbInvalid.RunMigrationsWithOptions(context.Background(), mapFS, "migrations", optsEmpty)
+	if err == nil || !strings.Contains(err.Error(), "invalid migrations table name") {
+		t.Fatalf("expected invalid migrations table name error from db config, got: %v", err)
+	}
+
+	err = dbInvalid.RollbackWithOptions(context.Background(), mapFS, "migrations", 1, optsEmpty)
+	if err == nil || !strings.Contains(err.Error(), "invalid migrations table name") {
+		t.Fatalf("expected invalid migrations table name error from db config on rollback, got: %v", err)
+	}
+
+	// 3. Explicit options.TableName overrides db.Config().MigrationsTable
+	optsOverride := postgres.MigrationOptions{
+		TableName:       "explicit_override_table",
+		AdvisoryLockKey: testAdvisoryLockKey,
+	}
+	err = dbCustom.RunMigrationsWithOptions(context.Background(), mapFS, "migrations", optsOverride)
+	if err == nil || !strings.Contains(err.Error(), "database pool is not initialized") {
+		t.Fatalf("expected nil pool error with explicit table override, got: %v", err)
+	}
+}
+
 func TestMigration_AdvisoryLockKeyZeroRejection(t *testing.T) {
 	database := &postgres.Database{Pool: nil}
 

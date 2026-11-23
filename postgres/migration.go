@@ -36,6 +36,17 @@ func (db *Database) migrationTable() string {
 	return "schema_migrations"
 }
 
+func (db *Database) resolveTableName(table string) (string, error) {
+	name := strings.TrimSpace(table)
+	if name == "" {
+		name = db.migrationTable()
+	}
+	if !validTableNameRegex.MatchString(name) {
+		return "", apperror.New(apperror.CodeInvalidInput, fmt.Sprintf("invalid migrations table name %q: must match identifier pattern [a-zA-Z_][a-zA-Z0-9_]*", name))
+	}
+	return name, nil
+}
+
 func sanitizeTableName(table string) (string, error) {
 	name := strings.TrimSpace(table)
 	if name == "" {
@@ -81,7 +92,7 @@ func (db *Database) RunMigrationsWithOptions(ctx context.Context, fsys fs.FS, di
 		return apperror.New(apperror.CodeInvalidInput, "advisory lock key must not be 0: required to prevent concurrent migration race conditions")
 	}
 
-	tableName, err := sanitizeTableName(opts.TableName)
+	tableName, err := db.resolveTableName(opts.TableName)
 	if err != nil {
 		return err
 	}
@@ -342,7 +353,7 @@ func (db *Database) RollbackWithOptions(ctx context.Context, fsys fs.FS, dir str
 		return apperror.New(apperror.CodeInvalidInput, "advisory lock key must not be 0: required to prevent concurrent migration race conditions")
 	}
 
-	tableName, err := sanitizeTableName(opts.TableName)
+	tableName, err := db.resolveTableName(opts.TableName)
 	if err != nil {
 		return err
 	}

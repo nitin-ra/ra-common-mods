@@ -96,8 +96,25 @@ func (db *Database) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) error 
 
 // WithTxOptions executes fn within a transaction using customized pgx.TxOptions
 // (e.g., custom isolation levels or read-only access).
+// It rejects contexts that already carry an active transaction (whether from the same or a different database)
+// to ensure single-database transaction isolation and prevent nested transaction deadlocks.
 func (db *Database) WithTxOptions(ctx context.Context, opts pgx.TxOptions, fn func(tx pgx.Tx) error) (err error) {
-	if db == nil || db.Pool == nil {
+	if db == nil {
+		return apperror.New(apperror.CodeInternal, "database instance is nil")
+	}
+
+	// Guard against calling WithTx with a context that already carries an active transaction.
+	// Nested transactions must participate via WithinTx or run on a clean context.
+	if ctx != nil {
+		if activeDBs, ok := ctx.Value(activeTxDatabasesKey{}).(map[*Database]struct{}); ok && len(activeDBs) > 0 {
+			if _, hasSelf := activeDBs[db]; hasSelf {
+				return apperror.New(apperror.CodeConflict, "context already contains an active transaction for this database; nested transactions must use WithinTx or a clean context")
+			}
+			return apperror.New(apperror.CodeConflict, "context already contains an active transaction for a different database; cross-database transaction isolation violated")
+		}
+	}
+
+	if db.Pool == nil {
 		return apperror.New(apperror.CodeInternal, "database pool is not initialized")
 	}
 
@@ -190,10 +207,10 @@ func (db *Database) WithinTxOptions(ctx context.Context, opts pgx.TxOptions, fn 
 	// 2. Check if a transaction for this database already exists in ctx (same-database nesting)
 	if existingTx, ok := db.TxFromContext(ctx); ok && existingTx != nil {
 		// Reject incompatible options attempted on an existing transaction
-		if opts.IsoLevel != "" || opts.AccessMode != "" || opts.DeferrableMode != "" {
+		if opts.IsoLevel != "" || opts.AccessMode != "" || opts.DeferrableMode != "" || opts.BeginQuery != "" || opts.CommitQuery != "" {
 			return apperror.New(apperror.CodeConflict, fmt.Sprintf(
-				"cannot apply transaction options (isoLevel=%q, accessMode=%q, deferrableMode=%q) to an existing transaction",
-				opts.IsoLevel, opts.AccessMode, opts.DeferrableMode,
+				"cannot apply transaction options (isoLevel=%q, accessMode=%q, deferrableMode=%q, beginQuery=%q, commitQuery=%q) to an existing transaction",
+				opts.IsoLevel, opts.AccessMode, opts.DeferrableMode, opts.BeginQuery, opts.CommitQuery,
 			))
 		}
 		// Directly participate in existing atomic transaction
