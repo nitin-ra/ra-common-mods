@@ -1,202 +1,168 @@
 # Kafka Module
 
-Common Golang Kafka module providing opinionated producer and consumer functionality for microservices.
-
-## Features
-
-- **Producer**: Synchronous message publishing with SASL/TLS support
-- **Consumer**: Sarama consumer-group based consumption with retry support
-- **Retry Logic**: Exponential backoff with configurable DLQ
-- **Middleware/Interceptors**: Logging, recovery, metrics, and tracing
-- **SASL Authentication**: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
-- **TLS Support**: Client certificates and CA verification
+Common Go Kafka module built on IBM Sarama (`v1.43.3`) and `log/slog`, separating cluster connectivity (`BrokerConfig`) from producer (`ProducerConfig`), consumer group (`ConsumerConfig`), and per-topic `Subscription` configuration.
 
 ## Installation
 
 ```bash
-go get github.com/routerarchitects/ra-common-mods/kafka
+go get github.com/routerarchitects/ra-common-mods/kafka@v0.2.0
 ```
 
 ## Quick Start
 
-### Producer
+### Producer (`NewProducer`)
+
+Use one `Producer` instance per `(BrokerConfig, ProducerConfig)`. `Publish`, `PublishWithHeaders`, and `PublishJSON` are synchronous and concurrency-safe across topics.
 
 ```go
-package main
+brokerCfg := kafka.DefaultBrokerConfig()
+brokerCfg.Brokers = []string{"localhost:9092"}
+brokerCfg.ClientID = "orders-service"
 
-import (
-    "context"
-    "log"
-    
-    "github.com/caarlos0/env/v11"
-    
-    "github.com/routerarchitects/ra-common-mods/kafka"
-)
+producerCfg := kafka.DefaultProducerConfig()
+prod, err := kafka.NewProducer(brokerCfg, producerCfg)
+if err != nil {
+	log.Fatal(err)
+}
+defer prod.Close()
 
-func main() {
-    var cfg kafka.Config
-    if err := env.Parse(&cfg); err != nil {
-        log.Fatal(err)
-    }
-    // Ensure required values are set (for example KAFKA_BROKERS).
-    
-    producer, err := kafka.NewProducer(cfg)
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer producer.Close()
-    
-    // Publish a message
-    err = producer.Publish(
-        context.Background(),
-        "my-topic",
-        []byte("key"),
-        []byte("value"),
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    // Or publish JSON
-    err = producer.PublishJSON(
-        context.Background(),
-        "my-topic",
-        "user-123",
-        map[string]interface{}{
-            "name": "John Doe",
-            "age": 30,
-        },
-    )
+if err := prod.PublishJSON(ctx, "orders.created", "order-123", map[string]any{"id": "order-123"}); err != nil {
+	log.Fatal(err)
 }
 ```
 
-### Consumer
+### Single-Topic & Multi-Topic Consumer (`NewConsumer`)
+
+A `Consumer` is one consumer group member (identified by `ConsumerConfig.GroupID`). Topic names are distinct from group IDs: register one or more topic subscriptions via `Subscribe`, then start the group once with `Run`.
 
 ```go
-package main
+brokerCfg := kafka.DefaultBrokerConfig()
+brokerCfg.Brokers = []string{"localhost:9092"}
+brokerCfg.ClientID = "orders-worker"
 
-import (
-    "context"
-    "log"
-    "log/slog"
-    "os"
-    "os/signal"
-    "syscall"
-    "time"
+consumerCfg := kafka.DefaultConsumerConfig()
+consumerCfg.GroupID = "orders-worker-group" // distinct from topic names
+consumerCfg.InitialOffset = "oldest"        // deliberate choice for critical streams
 
-    "github.com/caarlos0/env/v11"
-    
-    "github.com/routerarchitects/ra-common-mods/kafka"
-)
+consumer, err := kafka.NewConsumer(brokerCfg, consumerCfg, logger)
+if err != nil {
+	log.Fatal(err)
+}
+defer consumer.Close()
 
-func main() {
-    var cfg kafka.Config
-    if err := env.Parse(&cfg); err != nil {
-        log.Fatal(err)
-    }
-    // Ensure required values are set (for example KAFKA_BROKERS and KAFKA_CONSUMER_GROUP_ID).
-    
-    logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-    
-    consumer, err := kafka.NewConsumer(cfg, logger)
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer consumer.Close()
-    
-    // Create context with cancellation
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-    
-    // Handle shutdown gracefully
-    sigterm := make(chan os.Signal, 1)
-    signal.Notify(sigterm, syscall.SIGINT, syscall.SIGTERM)
-    go func() {
-        <-sigterm
-        cancel()
-    }()
-    
-    // Define message handler
-    handler := func(ctx context.Context, msg *kafka.Message) error {
-        logger.Info("received message",
-            "topic", msg.Topic,
-            "key", string(msg.Key),
-            "value", string(msg.Value),
-        )
-        // Process message...
-        return nil
-    }
-    
-    // Subscribe with options
-    opts := &kafka.SubscribeOptions{
-        AutoCommit: 5 * time.Second,
-        Interceptors: []kafka.Interceptor{
-            kafka.LoggingInterceptor(logger),
-            kafka.RecoveryInterceptor(logger),
-            kafka.MetricsInterceptor(),
-        },
-        RetryPolicy: &kafka.RetryPolicy{
-            Strategy: kafka.RetryStrategyLogAndIgnore,
-        },
-    }
-    
-    // Subscribe (blocking)
-    err = consumer.Subscribe(ctx, "my-topic", handler, opts)
-    if err != nil && err != context.Canceled {
-        log.Fatal(err)
-    }
+if err := consumer.Subscribe(kafka.Subscription{
+	Topic:       "orders.created",
+	Handler:     handleOrderCreated,
+	RetryPolicy: kafka.DefaultRetryPolicy(),
+}); err != nil {
+	log.Fatal(err)
+}
+
+if err := consumer.Subscribe(kafka.Subscription{
+	Topic:          "orders.audit",
+	Handler:        handleOrderAudit,
+	HandlerTimeout: 10 * time.Second,
+	RetryPolicy: &kafka.RetryPolicy{
+		Strategy:         kafka.RetryStrategyDLQ,
+		MaxRetries:       3,
+		InitialDelay:     100 * time.Millisecond,
+		MaxDelay:         5 * time.Second,
+		Multiplier:       2.0,
+		DLQTopic:         "orders.audit.dlq",
+		DLQProducer:      dlqProducer,
+		DLQFailurePolicy: kafka.DLQFailureStop,
+	},
+}); err != nil {
+	log.Fatal(err)
+}
+
+if err := consumer.Run(ctx); err != nil {
+	log.Fatal(err)
 }
 ```
 
-## Configuration
+### Hybrid Multi-Group Deployment
 
-### Environment-Based Configuration
+When topics require isolated group settings, rebalance lifecycles, or failure domains, construct multiple `Consumer` instances sharing the same `BrokerConfig` (each creates its own Sarama group client; never share a `sarama.Client` across consumer groups). Keep shared dependencies (DB pools, logger, shared DLQ `Producer`) open until all consumers have stopped.
 
-You can load configuration from environment variables directly using `github.com/caarlos0/env/v11`:
+See [examples/hybrid/main.go](examples/hybrid/main.go) for a complete runnable hybrid example.
 
-```go
-var cfg kafka.Config
-if err := env.Parse(&cfg); err != nil {
-    log.Fatal(err)
-}
+## Delivery, Retry & DLQ Semantics
+
+- **Sequential per partition, concurrent across partitions**: Handlers registered on a `Consumer` must be thread-safe across partitions and idempotent across replays.
+- **Explicit dispositions**: A message offset is marked only when the handler returns `nil` before session/attempt expiry, a DLQ write is acknowledged, or an applicable discard policy (`ignore` after retries, or `dlq` with `DLQFailureDiscard`) triggers while the session is active.
+- **Unresolved failures & cancellation**: Session cancellations (shutdown or rebalance) interrupt processing without marking the unresolved record. Under `DLQFailureStop`, the unresolved offset is left unmarked, later offsets in the partition are not processed, and `Run` returns the terminal error.
+- **Retry policies**:
+  - `RetryStrategyLogAndIgnore` (`ignore`): retries up to `1 + MaxRetries` attempts (`MaxRetries=0` executes once), then logs, records discard, and marks the offset. Intentionally lossy.
+  - `RetryStrategyDLQ` (`dlq`): retries up to `1 + MaxRetries` attempts, then publishes to `DLQTopic` preserving key, payload, and non-reserved headers while replacing `x-original-*` metadata headers (`x-original-topic`, `x-original-partition`, `x-original-offset`, `x-original-timestamp`, `x-original-consumer-group`, `x-original-error`, `x-original-attempts`). Requires explicit `DLQFailurePolicy`:
+    - `DLQFailureDiscard`: logs/meters discard and marks the source offset.
+    - `DLQFailureRetry`: retries only the DLQ write with jittered backoff until acknowledged or session cancellation.
+    - `DLQFailureStop`: leaves the source offset unmarked and stops `Run` with an error.
+  - `RetryStrategyInfinite` (`infinite`): retries with capped jittered exponential backoff until success or session cancellation.
+- **Timeouts & Shutdown**:
+  - `ConsumerConfig.MaxProcessingTime` is Sarama's message-channel backpressure setting, not a handler deadline.
+  - `ConsumerConfig.HandlerTimeout` / `Subscription.HandlerTimeout` applies a cooperative `context.WithTimeout` per attempt. Handlers must respect `ctx.Done()`.
+  - `ConsumerConfig.ShutdownTimeout` sets the graceful drain budget on `Close()` or parent context cancellation. Unresolved handlers exceeding the budget are cancelled and left unmarked.
+  - Never call `Close()` from inside a handler running on the same consumer instance; cancel the parent context instead.
+- **Synchronous Producer**: `Publish` checks `ctx.Err()` before marshaling/sending, coordinates safely with `Close()`, and cannot cancel an already in-flight Sarama synchronous request.
+
+## Observability (Opt-In)
+
+- **Health**: `consumer.Health()` returns a concurrency-safe `ConsumerHealth` snapshot (`State`, `Ready`, `AssignedClaims`, `LastError`, timestamps). `Ready` is `true` after session `Setup` (even with 0 claims) and `false` during startup, rebalance, drain, or terminal failure.
+- **Metrics**: Call `kafka.NewMetrics(reg)` with a caller-supplied `prometheus.Registerer` (no global registration) and pass `kafka.WithProducerMetrics(m)` / `kafka.WithConsumerMetrics(m)`.
+  - *Commit error caveat*: Sarama `v1.43.3`'s `session.Commit()` returns no error; `kafka_commit_errors_total` counts only positively identified commit errors from `Errors()` (`ErrOffsetMetadataTooLarge`, `ErrInvalidCommitOffsetSize`, `ErrUnstableOffsetCommit`).
+  - *Lag caveat*: `kafka_consumer_lag` is the observed in-process claim backlog (`HighWaterMarkOffset - nextOffset`), not broker-committed lag across offline partitions.
+- **Tracing**: Pass `kafka.TracingConfig{TracerProvider: tp, Propagator: prop}` via `WithProducerTracing` / `WithConsumerTracing` (no global provider installation) or `NewTracingInterceptor(cfg)`.
+
+## Upgrading from `v0.1.0` to `v0.2.0`
+
+| `v0.1.0` API | `v0.2.0` API |
+|---|---|
+| `kafka.Config` | `BrokerConfig` + `ProducerConfig` / `ConsumerConfig` (use `Default*Config()` or `env` tags) |
+| `NewProducer(cfg)` | `NewProducer(brokerCfg, producerCfg, opts...)` |
+| `NewConsumer(cfg, logger)` | `NewConsumer(brokerCfg, consumerCfg, logger, opts...)` |
+| `consumer.Subscribe(ctx, topic, h, opts)` | `consumer.Subscribe(Subscription{...})` then `consumer.Run(ctx)` |
+| `SubscribeMultiple(ctx, topics, h, opts)` | Call `consumer.Subscribe(...)` per topic, then `consumer.Run(ctx)` |
+| `SubscribeOptions.AutoCommit` (`-1` sentinel) | `ConsumerConfig.CommitMode` (`periodic` / `sync`) & `CommitInterval` |
+| `MetricsInterceptor()` / `TracingInterceptor()` | `NewMetrics` + `With*Metrics`, `TracingConfig` + `With*Tracing` / `NewTracingInterceptor` |
+
+### Key Semantic Changes
+
+1. `RetryStrategyLogAndIgnore` now performs bounded retries (`1 + MaxRetries`, default `3`) before discarding. Set `MaxRetries: 0` if a single attempt is desired.
+2. Unresolved interrupted messages (rebalance or shutdown timeout) are no longer marked; handlers must be idempotent.
+3. `RetryStrategyDLQ` requires an explicit `DLQFailurePolicy` (`discard`, `retry`, or `stop`) and rejects producers configured with `RequiredAcks=0`.
+4. Per-attempt handler timeout defaults to `30s`; review long-running handlers and configure `HandlerTimeout` accordingly.
+5. Configuration validation is strict (unknown `InitialOffset`, unknown `Compression`, conflicting `Idempotent`/`RequiredAcks`/`MaxRetries`, partial TLS cert/key pairs, invalid broker addresses).
+6. Keep existing `GroupID` values unchanged to preserve committed offsets. Moving topics between groups does not copy offsets automatically; coordinate assignor strategy changes (`roundrobin` / `sticky` / `range`) across group replicas.
+7. Close consumers before closing shared databases, loggers, or DLQ producers.
+
+## Local Integration Testing
+
+Integration tests are guarded by the `integration` build tag and target `KAFKA_TEST_BROKERS` (default `localhost:9092`):
+
+```bash
+# Start a pinned local Kafka KRaft broker
+docker run -d --name kafka-local -p 9092:9092 \
+  -e KAFKA_NODE_ID=1 \
+  -e KAFKA_PROCESS_ROLES=broker,controller \
+  -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+  -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+  -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+  -e KAFKA_AUTO_CREATE_TOPICS_ENABLE=false \
+  apache/kafka:3.7.2
+
+# Run unit + race tests
+go test -race ./...
+
+# Run real Kafka integration tests (optionally set KAFKA_TEST_CONTAINER=kafka-local for live outage test IT11)
+KAFKA_TEST_BROKERS=localhost:9092 KAFKA_TEST_CONTAINER=kafka-local \
+  go test -tags=integration -race -count=1 -v ./...
+
+# Stop and remove container
+docker rm -f kafka-local
 ```
-
-`kafka.Config` already has `env` and `envDefault` tags, so parsing fills values from environment variables and applies defaults where defined.
-Minimum required env vars for a working consumer setup are:
-- `KAFKA_BROKERS`
-- `KAFKA_CONSUMER_GROUP_ID`
-- `KAFKA_CONSUMER_COMMIT_INTERVAL` (must be greater than zero if set)
-
-Topic subscription is runtime-driven, not config-driven:
-- Use `consumer.Subscribe(ctx, topic, ...)` for a single topic.
-- Use `consumer.SubscribeMultiple(ctx, topics, ...)` for multiple topics.
-
-## Consumption Model
-
-The consumer processes messages synchronously per claim and marks offsets after processing.
-Commit behavior is controlled by `SubscribeOptions.AutoCommit` and consumer commit settings.
-`Consumer.CommitInterval` (`COMMIT_INTERVAL`) must be greater than zero.
-
-- `AutoCommit == -1`: offsets are committed synchronously after each processed message.
-- `AutoCommit == 0`: inherit `Consumer.CommitInterval` (`COMMIT_INTERVAL`).
-- `AutoCommit > 0`: offsets are auto-committed at the configured interval.
-
-## Retry & DLQ
-
-Failed messages are automatically retried with exponential backoff:
-
-1. Message fails → Retry with `InitialDelay`
-2. Exponential backoff → Multiply delay by `Multiplier` 
-3. Max retries exhausted:
-   - `RetryStrategyDLQ`: Send to DLQ topic (if configured)
-   - `RetryStrategyLogAndIgnore`: Log and skip message
-   - `RetryStrategyInfinite`: Retry until success or context cancellation
-
-## Middleware/Interceptors
-
-Built-in interceptors for cross-cutting concerns:
-
-- **LoggingInterceptor**: Logs message processing with duration
-- **RecoveryInterceptor**: Recovers from panics
-- **MetricsInterceptor**: Tracks metrics (integrate with Prometheus)
-- **TracingInterceptor**: Trace context propagation (integrate with OpenTelemetry)

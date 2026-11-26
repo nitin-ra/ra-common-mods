@@ -1,144 +1,35 @@
-Design Document: Common Kafka Module
-Goal Description
-Create a standard, robust, and opinionated Kafka module for Go microservices. This module will abstract the underlying Kafka driver to provide a consistent API for producing and consuming messages, ensuring best practices for error handling, observability (metrics/tracing), and configuration are applied uniformly across all services.
+# Design Document: Common Kafka Module
 
-User Review Required
-IMPORTANT
+## Overview
 
-Driver Selection: This design proposes using IBM/sarama as the underlying driver. It is a pure Go implementation, avoiding CGO dependencies (easier for Alpine builds), and is widely used and robust. Opinionated Defaults: The module will enforce specific patterns for:
+The `kafka` module provides a thin, explicit wrapper over IBM Sarama (`v1.43.3`) using `log/slog`, opt-in Prometheus metrics, and opt-in OpenTelemetry tracing. It keeps topic routing, group selection, and business handlers in the application while enforcing safe offset-acknowledgement, retry/DLQ, configuration validation, and shutdown invariants.
 
-context.Context usage for cancellation and tracing.
-slog for logging.
-OpenTelemetry for tracing.
-Prometheus for metrics.
-Proposed Architecture
-1. Configuration
-Configuration will be driven by a struct that can be loaded from env vars or config files.
+## Ownership & Architecture
 
-type Config struct {
-    Brokers       []string `json:"brokers" yaml:"brokers"`
-    SchemaRegistry URL     `json:"schema_registry,omitempty"` // Optional
-    ClientID      string   `json:"client_id"`
-    // Auth configuration (SASL/TLS)
-    Auth          AuthConfig `json:"auth"` 
-    // Consumer specific
-    Consumer      ConsumerConfig `json:"consumer"`
-    // Producer specific
-    Producer      ProducerConfig `json:"producer"`
-}
-2. Producer Interface
-The producer will support synchronous and asynchronous publishing (optional, default sync for safety/simplicity in "opinionated" design?). "Opinionated" usually favors safety -> Sync by default, or Async with robust error channel. Let's propose a simple synchronous-looking API that handles batching internally if possible, or just standard Sync.
+- **`BrokerConfig`**: Cluster endpoints (`host:port`), `ClientID`, SASL/TLS authentication, and socket `DialTimeout` / `ReadTimeout` / `WriteTimeout` (30s defaults).
+- **`ProducerConfig`**: `RequiredAcks`, `Idempotent`, `Compression`, `MaxRetries`, `RetryBackoff`, `MaxMessageBytes`, `Timeout`. Produces via `Producer` (`NewProducer`).
+- **`ConsumerConfig`**: `GroupID`, `InitialOffset` (`oldest`/`newest`), `BalanceStrategy` (`roundrobin`/`sticky`/`range`), `SessionTimeout`, `HeartbeatInterval`, `RebalanceTimeout`, `MaxProcessingTime` (Sarama delivery channel backpressure, not handler deadline), `CommitMode` (`periodic`/`sync`), `CommitInterval`, `HandlerTimeout` (per-attempt deadline), and `ShutdownTimeout` (drain budget).
+- **`Consumer` (`NewConsumer`)**: Owns exactly one `sarama.ConsumerGroup` per `Run`, serving all pre-registered `Subscription` entries (`Topic`, `Handler`, `HandlerTimeout`, `RetryPolicy`, `Interceptors`). Multiple `Consumer` instances may coexist per process for hybrid group isolation.
 
-type Producer interface {
-    // Publish sends a message to the specified topic.
-    // Context is used for tracing and timeout.
-    Publish(ctx context.Context, topic string, key, value []byte) error
-    
-    // PublishJSON convenience method
-    PublishJSON(ctx context.Context, topic string, key string, data interface{}) error
-    
-    Close() error
-}
-3. Consumer Interface
-The consumer uses a Subscribe model built on Sarama consumer groups. Message handling is synchronous per claim in the current implementation.
+## Delivery & Failure Model
 
-type Message struct {
-    Key, Value []byte
-    Topic      string
-    Partition  int32
-    Offset     int64
-    Headers    []RecordHeader
-    Timestamp  time.Time
-}
-// Handler processes a message. Return nil on success, error on failure.
-type Handler func(ctx context.Context, msg *Message) error
-type SubscribeOptions struct {
-    // AutoCommit controls commit mode:
-    //   = -1: sync commit after each processed message
-    //   = 0 : inherit consumer CommitInterval
-    //   > 0 : auto-commit at this interval
-    AutoCommit    time.Duration
-    
-    // Retry policy for failed messages
-    RetryPolicy   *RetryPolicy
-    
-    // Interceptors to run before handler
-    Interceptors  []Interceptor
-}
+1. **Sequential within a partition, concurrent across partitions**: `ConsumeClaim` processes messages synchronously in partition offset order without spawning detached per-message goroutines.
+2. **Explicit dispositions**: `processMessage` returns `outcomeProcessed`, `outcomeDeadLettered`, `outcomeDiscarded`, `outcomeInterrupted`, or `outcomeTerminalFailure`. Offsets are marked only for `outcomeProcessed`, `outcomeDeadLettered`, or `outcomeDiscarded` when `session.Context().Err() == nil`.
+3. **Cancellation precedence**: Session cancellation (rebalance or shutdown) interrupts processing immediately and leaves unresolved offsets unmarked.
+4. **Retries & DLQ**:
+   - Bounded retries run up to `1 + MaxRetries` attempts with capped exponential backoff and full positive-floor jitter (`[delay/2, delay]`).
+   - `RetryStrategyDLQ` writes a copy of the record with `x-original-*` metadata headers without mutating caller/original slices. When DLQ publication fails, `DLQFailureDiscard` marks and continues, `DLQFailureRetry` retries only the DLQ write with backoff, and `DLQFailureStop` cancels the consumer run with a terminal error without marking the failed offset.
+5. **No exactly-once claims**: Kafka commit and handler/DLQ side effects are separate operations; duplicates are possible on crashes or rebalances, so handlers must be idempotent.
 
-Note: consumer `CommitInterval` is expected to be greater than zero when configured.
-type Consumer interface {
-    // Subscribe to a topic with a handler.
-    // This method blocks until ctx is cancelled.
-    Subscribe(ctx context.Context, topic string, handler Handler, opts *SubscribeOptions) error
-    
-    // SubscribeMultiple subscribes to multiple topics with the same handler.
-    SubscribeMultiple(ctx context.Context, topics []string, handler Handler, opts *SubscribeOptions) error
-    
-    Close() error
-}
-Key Benefits:
+## Lifecycle & Graceful Shutdown
 
-Simple Subscribe API over Sarama consumer groups.
-Retry policy support with exponential backoff and optional DLQ.
-Interceptor support for cross-cutting concerns.
-4. Middleware / Interceptors
-Interceptors wrap the handler execution, allowing for cross-cutting concerns.
+- `Subscribe` registers and validates immutable subscription descriptors without broker I/O.
+- `Run` transitions `Registered -> Starting`, creates one `sarama.ConsumerGroup`, drains `Errors()` continuously until client close, and runs `Consume` with jittered reconnect backoff for transient errors and immediate termination for unrecoverable errors (auth, config, unexpected closed group).
+- On `Close()` or parent context cancellation, an `admissionGate` halts new message admissions while allowing admitted in-flight messages to finish within `ShutdownTimeout`. Idle `ConsumeClaim` goroutines wait on `session.Context().Done()` rather than returning early and prematurely aborting active partitions in the same Sarama session.
+- After the drain completes or expires, the internal group context is cancelled, `Cleanup` runs (performing a best-effort `session.Commit()` in `CommitSync` mode), the Sarama client is closed, and all owned goroutines are joined.
 
-// Interceptor wraps a handler with additional behavior (logging, metrics, tracing, etc.)
-type Interceptor func(next Handler) Handler
-// Built-in interceptors:
-// - TracingInterceptor: Extract/inject trace context from headers
-// - LoggingInterceptor: Log message receipt and processing duration
-// - MetricsInterceptor: Track processed/failed message counts
-// - RecoveryInterceptor: Recover from panics and return an error
-Example usage:
+## Observability & Driver Limitations
 
-opts := &kafka.SubscribeOptions{
-    Interceptors: []kafka.Interceptor{
-        kafka.TracingInterceptor(),
-        kafka.LoggingInterceptor(logger),
-        kafka.MetricsInterceptor(metrics),
-        kafka.RecoveryInterceptor(),
-    },
-}
-5. Resiliency (Opinionated)
-type RetryPolicy struct {
-    MaxRetries    int           // Default: 3
-    InitialDelay  time.Duration // Default: 100ms
-    MaxDelay      time.Duration // Default: 30s
-    Multiplier    float64       // Default: 2.0 (exponential backoff)
-    
-    // DLQ configuration
-    DLQTopic      string        // If set, send failed messages here after exhausting retries
-    DLQProducer   Producer      // Producer instance for DLQ
-}
-Behavior:
-
-If handler returns an error, the message is retried with exponential backoff
-After MaxRetries, the message is either sent to DLQ or logged/ignored depending on strategy
-Proposed Changes
-Structure of src/ra-common-mods/kafka:
-
-[NEW] 
-config.go
-Configuration structs and defaults.
-[NEW] 
-producer.go
-NewProducer(cfg Config) (Producer, error) implementation using Sarama.
-[NEW] 
-consumer.go
-NewConsumer(cfg Config) (Consumer, error) implementation using Sarama ConsumerGroup.
-[NEW] 
-message.go
-Wrapper struct for Kafka messages (Metadata, Headers, Value).
-[NEW] 
-middleware.go
-Standard interceptors.
-Verification Plan
-Automated Tests
-Unit Tests: Mock the underlying Sarama interfaces to test the wrapper logic (retries, middleware execution).
-Integration Tests: Spin up a Kafka container (via Docker) and run real produce/consume cycles.
-Note: Requires docker available in the environment.
-Manual Verification
-Create a cmd/example within the module or a separate test file that connects to a local Kafka (if available) and exchanges messages.
+- **Metrics**: Registered explicitly on a caller-supplied `prometheus.Registerer` (`NewMetrics`). Sarama `session.Commit()` returns no error; `kafka_commit_errors_total` counts only positively identifiable commit errors from `Errors()`. `kafka_consumer_lag` reflects in-process observed claim backlog (`HighWaterMarkOffset - nextOffset`) and is cleaned up per claim owner on `Cleanup`.
+- **Tracing**: Configured explicitly via `TracingConfig` (`TracerProvider` + `Propagator`), injecting/extracting W3C trace context on copied headers without touching globals.
+- **Synchronous Producer**: Context cancellation is checked before JSON marshaling and before `SendMessage`, but in-flight synchronous Sarama sends cannot be aborted mid-call.

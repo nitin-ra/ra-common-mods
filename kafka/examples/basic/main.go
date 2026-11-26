@@ -26,20 +26,14 @@ type Event struct {
 }
 
 type Config struct {
-	Log   logger.Config `json:"log"`
-	Kafka kafka.Config  `json:"kafka"`
+	Log      logger.Config        `json:"log"`
+	Broker   kafka.BrokerConfig   `json:"broker"`
+	Producer kafka.ProducerConfig `json:"producer" envPrefix:"KAFKA_PRODUCER_"`
+	Consumer kafka.ConsumerConfig `json:"consumer" envPrefix:"KAFKA_CONSUMER_"`
 }
 
 func main() {
-	// data, err := os.ReadFile("config.json")
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// Setup logger
 	var appCfg Config
-	// if err := json.Unmarshal(data, &appCfg); err != nil {
-	// 	panic(err)
-	// }
 	if err := env.Parse(&appCfg); err != nil {
 		panic(err)
 	}
@@ -52,47 +46,41 @@ func main() {
 
 	aLog.Info("Logger Initiated")
 
-	// Create context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle graceful shutdown
 	sigterm := make(chan os.Signal, 1)
 	signal.Notify(sigterm, syscall.SIGINT, syscall.SIGTERM)
 
-	// Configuration
-	cfg := appCfg.Kafka
-	if len(cfg.Brokers) == 0 {
-		cfg.Brokers = []string{"localhost:9092"}
+	brokerCfg := appCfg.Broker
+	if len(brokerCfg.Brokers) == 0 {
+		brokerCfg.Brokers = []string{"localhost:9092"}
 	}
-	cfg.ClientID = "kafka-example"
-	cfg.Consumer.GroupID = "example-consumer-group"
+	brokerCfg.ClientID = "kafka-example"
+
+	producerCfg := appCfg.Producer
+	consumerCfg := appCfg.Consumer
+	consumerCfg.GroupID = "example-consumer-group"
 
 	topic := "example-topic"
 
-	// Start producer in background
-	go runProducer(ctx, cfg, topic, aLog)
+	go runProducer(ctx, brokerCfg, producerCfg, topic, aLog)
 
-	// Wait a bit for producer to start
 	time.Sleep(2 * time.Second)
 
-	// Start consumer
-	go runConsumer(ctx, cfg, topic, aLog)
+	go runConsumer(ctx, brokerCfg, consumerCfg, topic, aLog)
 
-	// Wait for termination signal
 	<-sigterm
 	aLog.Info("Shutting down gracefully...")
 	cancel()
 
-	// Give some time for cleanup
 	time.Sleep(2 * time.Second)
 	aLog.Info("Shutdown complete")
 }
 
 // runProducer creates a producer and spawns producer goroutines to publish messages.
-func runProducer(ctx context.Context, cfg kafka.Config, topic string, logger *slog.Logger) {
-	// Create producer
-	producer, err := kafka.NewProducer(cfg)
+func runProducer(ctx context.Context, brokerCfg kafka.BrokerConfig, producerCfg kafka.ProducerConfig, topic string, logger *slog.Logger) {
+	producer, err := kafka.NewProducer(brokerCfg, producerCfg)
 	if err != nil {
 		logger.Error("Failed to create producer", "error", err)
 		return
@@ -167,9 +155,8 @@ func runProducer(ctx context.Context, cfg kafka.Config, topic string, logger *sl
 }
 
 // runConsumer creates a consumer and processes messages.
-func runConsumer(ctx context.Context, cfg kafka.Config, topic string, logger *slog.Logger) {
-	// Create consumer
-	consumer, err := kafka.NewConsumer(cfg, logger)
+func runConsumer(ctx context.Context, brokerCfg kafka.BrokerConfig, consumerCfg kafka.ConsumerConfig, topic string, logger *slog.Logger) {
+	consumer, err := kafka.NewConsumer(brokerCfg, consumerCfg, logger)
 	if err != nil {
 		logger.Error("Failed to create consumer", "error", err)
 		return
@@ -230,22 +217,24 @@ func runConsumer(ctx context.Context, cfg kafka.Config, topic string, logger *sl
 		return nil
 	}
 
-	// Subscribe options
-	opts := &kafka.SubscribeOptions{
+	// Register subscription
+	if err := consumer.Subscribe(kafka.Subscription{
+		Topic:   topic,
+		Handler: handler,
 		Interceptors: []kafka.Interceptor{
 			kafka.RecoveryInterceptor(logger),
-			kafka.MetricsInterceptor(),
 		},
-		RetryPolicy: &kafka.RetryPolicy{
-			Strategy: kafka.RetryStrategyLogAndIgnore,
-		},
+		RetryPolicy: kafka.DefaultRetryPolicy(),
+	}); err != nil {
+		logger.Error("Subscribe failed", "error", err)
+		return
 	}
 
 	// Start stats reporter
 	go reportStats(ctx, stats, logger)
 
-	// Subscribe (blocking until context is cancelled)
-	err = consumer.Subscribe(ctx, topic, handler, opts)
+	// Run consumer (blocking until context is cancelled)
+	err = consumer.Run(ctx)
 	if err != nil && err != context.Canceled {
 		logger.Error("Consumer error", "error", err)
 	}

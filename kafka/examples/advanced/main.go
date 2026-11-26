@@ -171,26 +171,18 @@ func main() {
 		}
 	}
 
-	baseCfg := kafka.Config{
-		Brokers:  brokers,
-		ClientID: "advanced-example",
-		Consumer: kafka.ConsumerConfig{
-			GroupID:           ConsumerGroup,
-			InitialOffset:     "newest",
-			SessionTimeout:    10 * time.Second,
-			HeartbeatInterval: 3 * time.Second,
-			CommitInterval:    5 * time.Second,
-		},
-		Producer: kafka.ProducerConfig{
-			RequiredAcks: -1,
-			Idempotent:   true,
-			MaxRetries:   3,
-			Timeout:      5 * time.Second,
-		},
-	}
+	brokerCfg := kafka.DefaultBrokerConfig()
+	brokerCfg.Brokers = brokers
+	brokerCfg.ClientID = "advanced-example"
+
+	producerCfg := kafka.DefaultProducerConfig()
+	producerCfg.Timeout = 5 * time.Second
+
+	consumerCfg := kafka.DefaultConsumerConfig()
+	consumerCfg.GroupID = ConsumerGroup
 
 	// 3. Create Shared Producer
-	producer, err := kafka.NewProducer(baseCfg)
+	producer, err := kafka.NewProducer(brokerCfg, producerCfg)
 	if err != nil {
 		l.Error("Failed to create producer", "error", err)
 		os.Exit(1)
@@ -220,28 +212,28 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runRetrySuccessScenario(ctx, l, baseCfg, producer, chaos, report)
+		runRetrySuccessScenario(ctx, l, brokerCfg, consumerCfg, producer, chaos, report)
 	}()
 
 	// --- Scenario 2: DLQ Strategy ---
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runDLQScenario(ctx, l, baseCfg, producer, chaos, report)
+		runDLQScenario(ctx, l, brokerCfg, consumerCfg, producer, chaos, report)
 	}()
 
 	// --- Scenario 3: Concurrency / Worker Pool ---
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runConcurrencyScenario(ctx, l, baseCfg, producer, report)
+		runConcurrencyScenario(ctx, l, brokerCfg, consumerCfg, producer, report)
 	}()
 
 	// --- Scenario 4: Multiple Independent Consumers ---
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runMultiConsumerScenario(ctx, l, baseCfg, producer, report)
+		runMultiConsumerScenario(ctx, l, brokerCfg, consumerCfg, producer, report)
 	}()
 
 	wg.Wait()
@@ -251,16 +243,16 @@ func main() {
 
 // --- Scenario Helpers ---
 
-func runRetrySuccessScenario(ctx context.Context, parentLog *slog.Logger, cfg kafka.Config, producer kafka.Producer, chaos *ChaosState, report *scenarioReport) {
+func runRetrySuccessScenario(ctx context.Context, parentLog *slog.Logger, brokerCfg kafka.BrokerConfig, baseConsumerCfg kafka.ConsumerConfig, producer kafka.Producer, chaos *ChaosState, report *scenarioReport) {
 	l := parentLog.With("scenario", "retry-success")
 	l.Info("Starting Scenario: Retry Success")
 
 	// Setup unique group for this scenario to avoid collisions
-	myCfg := cfg
-	myCfg.Consumer.GroupID = "group-retry-success"
-	myCfg.Consumer.InitialOffset = "oldest"
+	myCfg := baseConsumerCfg
+	myCfg.GroupID = "group-retry-success"
+	myCfg.InitialOffset = "oldest"
 
-	consumer, err := kafka.NewConsumer(myCfg, l)
+	consumer, err := kafka.NewConsumer(brokerCfg, myCfg, l)
 	if err != nil {
 		l.Error("Failed to create consumer", "error", err)
 		return
@@ -299,21 +291,26 @@ func runRetrySuccessScenario(ctx context.Context, parentLog *slog.Logger, cfg ka
 		return nil
 	}
 
-	opts := kafka.DefaultSubscribeOptions()
-	opts.AutoCommit = time.Second * 5 // >0 interval commit, 0 would inherit config.CommitInterval, -1 is per-message sync commit
-	opts.RetryPolicy = &kafka.RetryPolicy{
-		Strategy:     kafka.RetryStrategyInfinite, // Or ignore, but we want it to succeed eventually
-		MaxRetries:   5,
-		InitialDelay: 100 * time.Millisecond,
-		MaxDelay:     1 * time.Second,
-		Multiplier:   1.5,
+	if err := consumer.Subscribe(kafka.Subscription{
+		Topic:   TopicRetrySuccess,
+		Handler: handler,
+		RetryPolicy: &kafka.RetryPolicy{
+			Strategy:     kafka.RetryStrategyInfinite,
+			MaxRetries:   5,
+			InitialDelay: 100 * time.Millisecond,
+			MaxDelay:     1 * time.Second,
+			Multiplier:   1.5,
+		},
+	}); err != nil {
+		l.Error("Subscribe failed", "error", err)
+		return
 	}
 
 	// Run consumer for a fixed time or until verified (simplified: fixed time here)
 	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	if err := consumer.Subscribe(timeoutCtx, TopicRetrySuccess, handler, opts); err != nil {
+	if err := consumer.Run(timeoutCtx); err != nil {
 		if err != context.DeadlineExceeded && err != context.Canceled {
 			l.Error("Consumer exited with error", "error", err)
 		}
@@ -322,16 +319,16 @@ func runRetrySuccessScenario(ctx context.Context, parentLog *slog.Logger, cfg ka
 	l.Info("Scenario: Retry Success - Finished")
 }
 
-func runDLQScenario(ctx context.Context, parentLog *slog.Logger, cfg kafka.Config, producer kafka.Producer, chaos *ChaosState, report *scenarioReport) {
+func runDLQScenario(ctx context.Context, parentLog *slog.Logger, brokerCfg kafka.BrokerConfig, baseConsumerCfg kafka.ConsumerConfig, producer kafka.Producer, chaos *ChaosState, report *scenarioReport) {
 	l := parentLog.With("scenario", "dlq")
 	l.Info("Starting Scenario: DLQ")
 
-	myCfg := cfg
-	myCfg.Consumer.GroupID = "group-dlq"
-	myCfg.Consumer.InitialOffset = "oldest"
+	myCfg := baseConsumerCfg
+	myCfg.GroupID = "group-dlq"
+	myCfg.InitialOffset = "oldest"
 
 	// 1. Create Main Consumer (that will fail)
-	consumer, err := kafka.NewConsumer(myCfg, l)
+	consumer, err := kafka.NewConsumer(brokerCfg, myCfg, l)
 	if err != nil {
 		l.Error("Failed to create consumer", "error", err)
 		return
@@ -339,9 +336,10 @@ func runDLQScenario(ctx context.Context, parentLog *slog.Logger, cfg kafka.Confi
 	defer consumer.Close()
 
 	// 2. Create DLQ Consumer (to verify receipt)
-	verifyCfg := cfg
-	verifyCfg.Consumer.GroupID = "group-dlq-verify" // different group
-	dlqVerifier, err := kafka.NewConsumer(verifyCfg, l.With("role", "verifier"))
+	verifyCfg := baseConsumerCfg
+	verifyCfg.GroupID = "group-dlq-verify" // different group
+	verifyCfg.InitialOffset = "oldest"
+	dlqVerifier, err := kafka.NewConsumer(brokerCfg, verifyCfg, l.With("role", "verifier"))
 	if err != nil {
 		l.Error("Failed to create DLQ verifier consumer", "error", err)
 		return
@@ -382,21 +380,28 @@ func runDLQScenario(ctx context.Context, parentLog *slog.Logger, cfg kafka.Confi
 		}
 
 		// Configure Policy with DLQ
-		opts := kafka.DefaultSubscribeOptions()
-		opts.RetryPolicy = &kafka.RetryPolicy{
-			Strategy:     kafka.RetryStrategyDLQ,
-			MaxRetries:   2,
-			InitialDelay: 50 * time.Millisecond,
-			MaxDelay:     1 * time.Second,
-			Multiplier:   2.0,
-			DLQTopic:     TopicDLQTarget,
-			DLQProducer:  producer, // Using shared producer
+		if err := consumer.Subscribe(kafka.Subscription{
+			Topic:   TopicRetryDLQ,
+			Handler: handler,
+			RetryPolicy: &kafka.RetryPolicy{
+				Strategy:         kafka.RetryStrategyDLQ,
+				MaxRetries:       2,
+				InitialDelay:     50 * time.Millisecond,
+				MaxDelay:         1 * time.Second,
+				Multiplier:       2.0,
+				DLQTopic:         TopicDLQTarget,
+				DLQProducer:      producer, // Using shared producer
+				DLQFailurePolicy: kafka.DLQFailureStop,
+			},
+		}); err != nil {
+			l.Error("DLQ subscribe failed", "error", err)
+			return
 		}
 
 		// Run briefly
 		timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		if err := consumer.Subscribe(timeoutCtx, TopicRetryDLQ, handler, opts); err != nil &&
+		if err := consumer.Run(timeoutCtx); err != nil &&
 			err != context.Canceled && err != context.DeadlineExceeded {
 			l.Error("DLQ scenario consumer exited with error", "error", err)
 		}
@@ -409,7 +414,7 @@ func runDLQScenario(ctx context.Context, parentLog *slog.Logger, cfg kafka.Confi
 			// Check headers for x-original-topic
 			origTopic := ""
 			for _, h := range msg.Headers {
-				if h.Key == "x-original-topic" {
+				if h.Key == kafka.HeaderOriginalTopic {
 					origTopic = string(h.Value)
 				}
 			}
@@ -421,9 +426,17 @@ func runDLQScenario(ctx context.Context, parentLog *slog.Logger, cfg kafka.Confi
 			return nil
 		}
 
+		if err := dlqVerifier.Subscribe(kafka.Subscription{
+			Topic:   TopicDLQTarget,
+			Handler: handler,
+		}); err != nil {
+			l.Error("DLQ verifier subscribe failed", "error", err)
+			return
+		}
+
 		timeoutCtx, cancel := context.WithTimeout(ctx, 6*time.Second) // slightly longer
 		defer cancel()
-		if err := dlqVerifier.Subscribe(timeoutCtx, TopicDLQTarget, handler, nil); err != nil &&
+		if err := dlqVerifier.Run(timeoutCtx); err != nil &&
 			err != context.Canceled && err != context.DeadlineExceeded {
 			l.Error("DLQ verifier exited with error", "error", err)
 		}
@@ -439,13 +452,13 @@ func runDLQScenario(ctx context.Context, parentLog *slog.Logger, cfg kafka.Confi
 	assertScenario(l, report, "dlq", dlqReceived.Load(), "expected message was not received in DLQ")
 }
 
-func runConcurrencyScenario(ctx context.Context, parentLog *slog.Logger, cfg kafka.Config, producer kafka.Producer, report *scenarioReport) {
+func runConcurrencyScenario(ctx context.Context, parentLog *slog.Logger, brokerCfg kafka.BrokerConfig, baseConsumerCfg kafka.ConsumerConfig, producer kafka.Producer, report *scenarioReport) {
 	l := parentLog.With("scenario", "concurrency")
 	l.Info("Starting Scenario: Concurrency")
 
-	myCfg := cfg
-	myCfg.Consumer.GroupID = "group-concurrent"
-	myCfg.Consumer.InitialOffset = "oldest"
+	myCfg := baseConsumerCfg
+	myCfg.GroupID = "group-concurrent"
+	myCfg.InitialOffset = "oldest"
 
 	// Note: For this to work efficiently, TopicConcurrency should have > 1 partition.
 	// If it has 1 partition, Sarama will give it to only 1 consumer in the group.
@@ -475,7 +488,7 @@ func runConcurrencyScenario(ctx context.Context, parentLog *slog.Logger, cfg kaf
 			defer wg.Done()
 			wLog := l.With("worker", workerID)
 
-			c, err := kafka.NewConsumer(myCfg, wLog)
+			c, err := kafka.NewConsumer(brokerCfg, myCfg, wLog)
 			if err != nil {
 				wLog.Error("Failed to create worker consumer", "error", err)
 				return
@@ -490,11 +503,19 @@ func runConcurrencyScenario(ctx context.Context, parentLog *slog.Logger, cfg kaf
 				return nil
 			}
 
+			if err := c.Subscribe(kafka.Subscription{
+				Topic:   TopicConcurrency,
+				Handler: handler,
+			}); err != nil {
+				wLog.Error("Failed to subscribe worker consumer", "error", err)
+				return
+			}
+
 			// Run for 5 seconds
 			timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 
-			if err := c.Subscribe(timeoutCtx, TopicConcurrency, handler, nil); err != nil &&
+			if err := c.Run(timeoutCtx); err != nil &&
 				err != context.Canceled && err != context.DeadlineExceeded {
 				wLog.Error("Worker consumer exited with error", "error", err)
 			}
@@ -506,7 +527,7 @@ func runConcurrencyScenario(ctx context.Context, parentLog *slog.Logger, cfg kaf
 	l.Info("Scenario: Concurrency - Finished")
 }
 
-func runMultiConsumerScenario(ctx context.Context, parentLog *slog.Logger, cfg kafka.Config, producer kafka.Producer, report *scenarioReport) {
+func runMultiConsumerScenario(ctx context.Context, parentLog *slog.Logger, brokerCfg kafka.BrokerConfig, baseConsumerCfg kafka.ConsumerConfig, producer kafka.Producer, report *scenarioReport) {
 	l := parentLog.With("scenario", "multi-consumer")
 	l.Info("Starting Scenario: Multi Independent Consumers")
 
@@ -518,11 +539,11 @@ func runMultiConsumerScenario(ctx context.Context, parentLog *slog.Logger, cfg k
 	// Consumer A
 	go func() {
 		defer wg.Done()
-		myCfg := cfg
-		myCfg.Consumer.GroupID = "group-service-A"
-		myCfg.Consumer.InitialOffset = "oldest"
+		myCfg := baseConsumerCfg
+		myCfg.GroupID = "group-service-A"
+		myCfg.InitialOffset = "oldest"
 
-		c, err := kafka.NewConsumer(myCfg, l.With("service", "A"))
+		c, err := kafka.NewConsumer(brokerCfg, myCfg, l.With("service", "A"))
 		if err != nil {
 			l.Error("Failed to create service A consumer", "error", err)
 			return
@@ -538,9 +559,17 @@ func runMultiConsumerScenario(ctx context.Context, parentLog *slog.Logger, cfg k
 			return nil
 		}
 
+		if err := c.Subscribe(kafka.Subscription{
+			Topic:   TopicMultiConsumerA,
+			Handler: handler,
+		}); err != nil {
+			l.Error("Service A subscribe failed", "error", err)
+			return
+		}
+
 		timeoutCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 		defer cancel()
-		if err := c.Subscribe(timeoutCtx, TopicMultiConsumerA, handler, nil); err != nil &&
+		if err := c.Run(timeoutCtx); err != nil &&
 			err != context.Canceled && err != context.DeadlineExceeded {
 			l.Error("Service A consumer exited with error", "error", err)
 		}
@@ -549,11 +578,11 @@ func runMultiConsumerScenario(ctx context.Context, parentLog *slog.Logger, cfg k
 	// Consumer B
 	go func() {
 		defer wg.Done()
-		myCfg2 := cfg
-		myCfg2.Consumer.GroupID = "group-service-B"
-		myCfg2.Consumer.InitialOffset = "oldest"
+		myCfg2 := baseConsumerCfg
+		myCfg2.GroupID = "group-service-B"
+		myCfg2.InitialOffset = "oldest"
 
-		c, err := kafka.NewConsumer(myCfg2, l.With("service", "B"))
+		c, err := kafka.NewConsumer(brokerCfg, myCfg2, l.With("service", "B"))
 		if err != nil {
 			l.Error("Failed to create service B consumer", "error", err)
 			return
@@ -569,9 +598,17 @@ func runMultiConsumerScenario(ctx context.Context, parentLog *slog.Logger, cfg k
 			return nil
 		}
 
+		if err := c.Subscribe(kafka.Subscription{
+			Topic:   TopicMultiConsumerB,
+			Handler: handler,
+		}); err != nil {
+			l.Error("Service B subscribe failed", "error", err)
+			return
+		}
+
 		timeoutCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 		defer cancel()
-		if err := c.Subscribe(timeoutCtx, TopicMultiConsumerB, handler, nil); err != nil &&
+		if err := c.Run(timeoutCtx); err != nil &&
 			err != context.Canceled && err != context.DeadlineExceeded {
 			l.Error("Service B consumer exited with error", "error", err)
 		}
