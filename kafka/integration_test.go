@@ -479,9 +479,7 @@ func TestIT04_BoundedRetriesAndRealDLQ(t *testing.T) {
 	checkHdr(kafka.HeaderOriginalOffset, "0")
 	checkHdr(kafka.HeaderOriginalConsumerGroup, srcGroup)
 	checkHdr(kafka.HeaderOriginalAttempts, "3")
-	if v, ok := dlqMsg.GetHeader(kafka.HeaderOriginalError); !ok || !strings.Contains(string(v), "permanent validation failure") {
-		t.Fatalf("unexpected x-original-error: %q", string(v))
-	}
+	checkHdr(kafka.HeaderOriginalError, "handler_error")
 }
 
 func TestIT05_DLQFailDiscardAndStopOffsetSafety(t *testing.T) {
@@ -1020,7 +1018,10 @@ func TestIT10_MultipleReplicasAndAssignors(t *testing.T) {
 			topic := uniqueName("it10-" + strategy)
 			createTestTopic(t, brokers, topic, 4)
 
-			prod, err := kafka.NewProducer(brokerCfgFor(brokers), kafka.DefaultProducerConfig())
+			prodCfg := kafka.DefaultProducerConfig()
+			prodCfg.MaxRetries = 10
+			prodCfg.RetryBackoff = 200 * time.Millisecond
+			prod, err := kafka.NewProducer(brokerCfgFor(brokers), prodCfg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1100,13 +1101,24 @@ func TestIT11_BrokerOutageAndRestoration(t *testing.T) {
 	topic := uniqueName("it11-outage")
 	createTestTopic(t, brokers, topic, 1)
 
-	prod, err := kafka.NewProducer(brokerCfgFor(brokers), kafka.DefaultProducerConfig())
+	bCfg := brokerCfgFor(brokers)
+	bCfg.DialTimeout = time.Second
+	bCfg.ReadTimeout = time.Second
+	bCfg.WriteTimeout = time.Second
+
+	cCfg := consumerCfgFor(uniqueName("grp-it11"))
+	cCfg.SessionTimeout = 6 * time.Second
+	cCfg.HeartbeatInterval = 1500 * time.Millisecond
+	cCfg.RebalanceTimeout = 6 * time.Second
+	cCfg.ShutdownTimeout = 2 * time.Second
+
+	prod, err := kafka.NewProducer(bCfg, kafka.DefaultProducerConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer prod.Close()
 
-	gc, err := kafka.NewConsumer(brokerCfgFor(brokers), consumerCfgFor(uniqueName("grp-it11")), testLogger())
+	gc, err := kafka.NewConsumer(bCfg, cCfg, testLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1131,21 +1143,86 @@ func TestIT11_BrokerOutageAndRestoration(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- gc.Run(ctx) }()
 
+	// Start a second consumer before the outage so it enters consumeLoop, then cancel it mid-outage.
+	cancelOutageCfg := consumerCfgFor(uniqueName("grp-it11-cancel"))
+	cancelOutageCfg.SessionTimeout = 6 * time.Second
+	cancelOutageCfg.HeartbeatInterval = 1500 * time.Millisecond
+	cancelOutageCfg.RebalanceTimeout = 6 * time.Second
+	cancelOutageCfg.ShutdownTimeout = time.Second
+	gcOutage, err := kafka.NewConsumer(bCfg, cancelOutageCfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gcOutage.Subscribe(kafka.Subscription{
+		Topic:   topic,
+		Handler: func(context.Context, *kafka.Message) error { return nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	outageCtx, outageCancel := context.WithCancel(context.Background())
+	outageDone := make(chan error, 1)
+	go func() { outageDone <- gcOutage.Run(outageCtx) }()
+
 	if err := prod.Publish(context.Background(), topic, []byte("k"), []byte("before")); err != nil {
 		t.Fatal(err)
 	}
-	waitForCondition(t, 15*time.Second, "before outage message", gotBefore.Load)
+	waitForCondition(t, 15*time.Second, "before outage message and outage consumer ready", func() bool {
+		return gotBefore.Load() && gcOutage.Health().Ready
+	})
 
-	// Pause broker container to simulate outage, then unpause to restore.
+	// Always unpause the container on cleanup so a failure never leaves the broker wedged.
+	var paused atomic.Bool
+	t.Cleanup(func() {
+		if paused.Load() {
+			_ = exec.Command("docker", "unpause", container).Run()
+		}
+	})
+
+	// Pause broker longer than ReadTimeout (1s) and SessionTimeout (6s) and observe session disruption.
+	pauseStart := time.Now()
 	if out, err := exec.Command("docker", "pause", container).CombinedOutput(); err != nil {
 		t.Fatalf("docker pause %s: %v (%s)", container, err, string(out))
 	}
-	time.Sleep(2 * time.Second)
+	paused.Store(true)
+
+	waitForCondition(t, 25*time.Second, "consumers observe outage error or session disruption", func() bool {
+		h1 := gc.Health()
+		h2 := gcOutage.Health()
+		return (h1.LastError != "" || !h1.Ready) && (h2.LastError != "" || !h2.Ready)
+	})
+
+	// Cancel gcOutage mid-outage and verify prompt exit without retrying after stop.
+	// Note: Sarama's release()/LeaveGroup network timeouts on a paused socket bound total cleanup
+	// duration, and client.Close() may return a LeaveGroup network error while the broker is paused.
+	cancelStart := time.Now()
+	outageCancel()
+	select {
+	case err := <-outageDone:
+		if err != nil && !strings.Contains(err.Error(), "consumer group close:") {
+			t.Fatalf("outage cancel Run returned unexpected non-close error: %v", err)
+		}
+		t.Logf("outage cancel exited in %s after %s pause (err=%v)", time.Since(cancelStart), time.Since(pauseStart), err)
+	case <-time.After(35 * time.Second):
+		t.Fatalf("outage consumer did not exit within 35s upon cancellation")
+	}
+	if h := gcOutage.Health(); (h.State != kafka.ConsumerStateStopped && h.State != kafka.ConsumerStateFailed) || h.Ready {
+		t.Fatalf("expected Stopped/Failed and unready after outage cancel, got %+v", h)
+	}
+	_ = gcOutage.Close()
+
+	// Ensure total broker pause exceeds SessionTimeout (6s) before restoring the broker.
+	if remaining := (cCfg.SessionTimeout + time.Second) - time.Since(pauseStart); remaining > 0 {
+		time.Sleep(remaining)
+	}
+	t.Logf("restoring broker after %s pause", time.Since(pauseStart))
+
+	// Restore broker and verify original consumer recovers and consumes new records.
 	if out, err := exec.Command("docker", "unpause", container).CombinedOutput(); err != nil {
 		t.Fatalf("docker unpause %s: %v (%s)", container, err, string(out))
 	}
+	paused.Store(false)
 
-	waitForCondition(t, 25*time.Second, "publish & consume after restoration", func() bool {
+	waitForCondition(t, 30*time.Second, "publish & consume after restoration", func() bool {
 		if !gotAfter.Load() {
 			_ = prod.Publish(context.Background(), topic, []byte("k"), []byte("after"))
 		}
@@ -1158,7 +1235,7 @@ func TestIT11_BrokerOutageAndRestoration(t *testing.T) {
 	}
 }
 
-func TestIT12_GroupOffsetContinuityOnRestart(t *testing.T) {
+func TestIT12_GroupOffsetContinuityAndInitialOffsetReplay(t *testing.T) {
 	brokers := integrationBrokers(t)
 	topic := uniqueName("it12-continuity")
 	createTestTopic(t, brokers, topic, 1)
@@ -1169,6 +1246,7 @@ func TestIT12_GroupOffsetContinuityOnRestart(t *testing.T) {
 	}
 	defer prod.Close()
 
+	// 1. Existing committed offset remains authoritative even when InitialOffset="newest".
 	if err := prod.Publish(context.Background(), topic, []byte("k1"), []byte("first")); err != nil {
 		t.Fatal(err)
 	}
@@ -1210,12 +1288,10 @@ func TestIT12_GroupOffsetContinuityOnRestart(t *testing.T) {
 		t.Fatalf("first consumer Run: %v", err)
 	}
 
-	// Publish second message and verify a restarted Consumer with same group ID resumes from offset 1 (no replay of "first").
 	if err := prod.Publish(context.Background(), topic, []byte("k2"), []byte("second")); err != nil {
 		t.Fatal(err)
 	}
 
-	// Even with InitialOffset="newest", an existing valid committed offset (1) must be preserved.
 	cc2 := consumerCfgFor(groupID)
 	cc2.InitialOffset = "newest"
 	c2, err := kafka.NewConsumer(brokerCfgFor(brokers), cc2, testLogger())
@@ -1242,5 +1318,86 @@ func TestIT12_GroupOffsetContinuityOnRestart(t *testing.T) {
 	}
 	if !slices.Equal(values, []string{"second"}) {
 		t.Fatalf("expected continuity from committed offset with only [second], got %v", values)
+	}
+
+	// 2. R07: Fresh group with NO committed offset yet: compare "newest" (skips pre-existing) vs "oldest" (replays).
+	replayTopic := uniqueName("it12-replay")
+	createTestTopic(t, brokers, replayTopic, 1)
+	if err := prod.Publish(context.Background(), replayTopic, []byte("k0"), []byte("unresolved-uncommitted")); err != nil {
+		t.Fatal(err)
+	}
+
+	newestGroup := uniqueName("grp-it12-newest")
+	newestCfg := consumerCfgFor(newestGroup)
+	newestCfg.InitialOffset = "newest"
+	cNewest, err := kafka.NewConsumer(brokerCfgFor(brokers), newestCfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var newestSeen []string
+	var newestReady atomic.Bool
+	nCtx, nCancel := context.WithCancel(context.Background())
+	if err := cNewest.Subscribe(kafka.Subscription{
+		Topic: replayTopic,
+		Handler: func(ctx context.Context, msg *kafka.Message) error {
+			mu.Lock()
+			newestSeen = append(newestSeen, string(msg.Value))
+			mu.Unlock()
+			if string(msg.Value) == "after-newest-join" {
+				nCancel()
+			}
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	nDone := make(chan error, 1)
+	go func() { nDone <- cNewest.Run(nCtx) }()
+	waitForCondition(t, 15*time.Second, "newest consumer ready", func() bool {
+		if cNewest.Health().Ready {
+			newestReady.Store(true)
+			return true
+		}
+		return false
+	})
+	if err := prod.Publish(context.Background(), replayTopic, []byte("k1"), []byte("after-newest-join")); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-nDone; err != nil {
+		t.Fatalf("cNewest Run: %v", err)
+	}
+	if !newestReady.Load() || !slices.Equal(newestSeen, []string{"after-newest-join"}) {
+		t.Fatalf("expected InitialOffset=newest without committed offset to skip earlier record, got %v", newestSeen)
+	}
+
+	oldestGroup := uniqueName("grp-it12-oldest")
+	oldestCfg := consumerCfgFor(oldestGroup)
+	oldestCfg.InitialOffset = "oldest"
+	cOldest, err := kafka.NewConsumer(brokerCfgFor(brokers), oldestCfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oldestSeen []string
+	oCtx, oCancel := context.WithCancel(context.Background())
+	if err := cOldest.Subscribe(kafka.Subscription{
+		Topic: replayTopic,
+		Handler: func(ctx context.Context, msg *kafka.Message) error {
+			mu.Lock()
+			oldestSeen = append(oldestSeen, string(msg.Value))
+			count := len(oldestSeen)
+			mu.Unlock()
+			if count == 2 {
+				oCancel()
+			}
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cOldest.Run(oCtx); err != nil {
+		t.Fatalf("cOldest Run: %v", err)
+	}
+	if !slices.Equal(oldestSeen, []string{"unresolved-uncommitted", "after-newest-join"}) {
+		t.Fatalf("expected InitialOffset=oldest to replay historical records, got %v", oldestSeen)
 	}
 }

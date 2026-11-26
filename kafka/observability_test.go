@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -263,7 +264,7 @@ func TestOpenTelemetryTracingAndDisabledMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = pDisabled.Close()
-	if len(fpDisabled.sent[0].Headers) != 0 {
+	if len(fpDisabled.sentMessages()[0].Headers) != 0 {
 		t.Fatalf("disabled tracing should not inject headers")
 	}
 
@@ -297,7 +298,7 @@ func TestOpenTelemetryTracingAndDisabledMode(t *testing.T) {
 		t.Fatalf("caller header slice must not be mutated by tracing injection")
 	}
 
-	sentMsg := fp.sent[0]
+	sentMsg := fp.sentMessages()[0]
 	var saramaHeaders []*sarama.RecordHeader
 	var hasTraceParent bool
 	for _, h := range sentMsg.Headers {
@@ -348,7 +349,7 @@ func TestOpenTelemetryTracingAndDisabledMode(t *testing.T) {
 				t.Fatalf("expected valid extracted/child SpanContext inside handler")
 			}
 			if attempt.Add(1) == 1 {
-				panic("boom-in-handler")
+				panic("SECRET_PANIC_TOKEN_999")
 			}
 			go func() {
 				time.Sleep(10 * time.Millisecond)
@@ -375,10 +376,116 @@ func TestOpenTelemetryTracingAndDisabledMode(t *testing.T) {
 		pubSpan.SpanContext().TraceID() != c2.SpanContext().TraceID() {
 		t.Fatalf("expected producer and consumer spans to share TraceID")
 	}
-	if c1.Status().Code != codes.Error {
-		t.Fatalf("expected panic attempt span to have Error status, got %v", c1.Status().Code)
+	if c1.Status().Code != codes.Error || strings.Contains(c1.Status().Description, "SECRET_PANIC_TOKEN_999") {
+		t.Fatalf("expected safe Error status on panic span, got %+v", c1.Status())
+	}
+	for _, ev := range c1.Events() {
+		for _, attr := range ev.Attributes {
+			if strings.Contains(attr.Value.AsString(), "SECRET_PANIC_TOKEN_999") {
+				t.Fatalf("secret panic value leaked into span event attribute %s=%q", attr.Key, attr.Value.AsString())
+			}
+		}
 	}
 	if c2.Status().Code == codes.Error {
 		t.Fatalf("expected retry success span not to have Error status")
+	}
+}
+
+func TestMetricsLagOwnershipAndReadinessConcurrent(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m, err := NewMetrics(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Stale owner cleanup must not delete a new owner's live lag series.
+	m.recordLag(1, "grp-own", "orders", 0, 10)
+	m.recordLag(2, "grp-own", "orders", 0, 42)
+	m.cleanupLag(1, "grp-own", "orders", 0)
+
+	if got := testutil.ToFloat64(m.consumerLag.WithLabelValues("grp-own", "orders", "0")); got != 42 {
+		t.Fatalf("stale owner cleanup modified/deleted live owner lag: got %v, want 42", got)
+	}
+
+	m.cleanupLag(2, "grp-own", "orders", 0)
+	fams, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range fams {
+		if f.GetName() == "kafka_consumer_lag" && len(f.GetMetric()) != 0 {
+			t.Fatalf("expected lag series deleted after current owner cleanup, got %d", len(f.GetMetric()))
+		}
+	}
+
+	// Concurrent lag ownership stress under -race.
+	var wg sync.WaitGroup
+	for g := 0; g < 16; g++ {
+		wg.Add(1)
+		id := uint64(g + 1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				m.recordLag(id, "grp-race", "t", int32(i%3), int64(i))
+				m.cleanupLag(id, "grp-race", "t", int32(i%3))
+			}
+		}()
+	}
+	wg.Wait()
+
+	// 2. Concurrent readiness transitions during shutdown cannot publish stale Ready=1.
+	fg := newFakeConsumerGroup()
+	setupDone := make(chan struct{})
+	allowExit := make(chan struct{})
+	fg.consumeFn = func(runCtx context.Context, topics []string, handler sarama.ConsumerGroupHandler) error {
+		sess := newFakeSession(runCtx, map[string][]int32{"t": {0}})
+		if err := handler.Setup(sess); err != nil {
+			return err
+		}
+		close(setupDone)
+		<-allowExit
+		<-runCtx.Done()
+		return handler.Cleanup(sess)
+	}
+
+	gc, err := NewConsumer(testBrokerConfig(), testConsumerConfig("grp-ready-race"), discardLogger(),
+		WithConsumerMetrics(m),
+		func(o *consumerOptions) {
+			o.consumerGroupFactory = func([]string, string, *sarama.Config) (consumerGroupClient, error) { return fg, nil }
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gc.Subscribe(Subscription{Topic: "t", Handler: func(context.Context, *Message) error { return nil }}); err != nil {
+		t.Fatal(err)
+	}
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- gc.Run(context.Background()) }()
+	<-setupDone
+
+	// Trigger concurrent Setup-like readiness publication racing with Close().
+	cons := gc.(*consumer)
+	var rwg sync.WaitGroup
+	rwg.Add(2)
+	go func() {
+		defer rwg.Done()
+		cons.publishReadiness()
+	}()
+	go func() {
+		defer rwg.Done()
+		close(allowExit)
+		_ = gc.Close()
+	}()
+	rwg.Wait()
+	if err := <-runErr; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if gc.Health().Ready {
+		t.Fatalf("expected Health().Ready=false after Close")
+	}
+	if got := testutil.ToFloat64(m.consumerReady.WithLabelValues("grp-ready-race")); got != 0 {
+		t.Fatalf("expected kafka_consumer_ready=0 after Close, got %v", got)
 	}
 }

@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -99,8 +100,10 @@ func (kt *kafkaTracer) startPublishSpan(ctx context.Context, topic string, heade
 
 	endFn := func(err error) {
 		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, sanitizeAndBoundErrorString(err.Error(), 256))
+			category := "publish_" + classifyPublishError(err)
+			span.SetAttributes(attribute.String("error.type", category))
+			span.RecordError(errors.New(category))
+			span.SetStatus(codes.Error, category)
 		}
 		span.End()
 	}
@@ -136,8 +139,10 @@ func (kt *kafkaTracer) startConsumeSpan(ctx context.Context, groupID string, msg
 
 	endFn := func(err error) {
 		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, sanitizeAndBoundErrorString(err.Error(), 256))
+			category := classifyFailureCategory(err)
+			span.SetAttributes(attribute.String("error.type", category))
+			span.RecordError(errors.New(category))
+			span.SetStatus(codes.Error, category)
 		}
 		span.End()
 	}

@@ -3,6 +3,7 @@ package kafka
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,12 +24,27 @@ type fakeSyncProducer struct {
 func (f *fakeSyncProducer) SendMessage(msg *sarama.ProducerMessage) (int32, int64, error) {
 	f.mu.Lock()
 	f.sent = append(f.sent, msg)
+	offset := int64(len(f.sent))
 	fn := f.sendFn
 	f.mu.Unlock()
 	if fn != nil {
 		return fn(msg)
 	}
-	return 0, int64(len(f.sent)), nil
+	return 0, offset, nil
+}
+
+func (f *fakeSyncProducer) sentMessages() []*sarama.ProducerMessage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*sarama.ProducerMessage, len(f.sent))
+	copy(out, f.sent)
+	return out
+}
+
+func (f *fakeSyncProducer) sentCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sent)
 }
 
 func (f *fakeSyncProducer) Close() error {
@@ -51,9 +67,76 @@ func newTestProducer(t *testing.T, f *fakeSyncProducer, mutate func(*ProducerCon
 		}
 	})
 	if err != nil {
-		t.Fatalf("NewProducerWithConfig: %v", err)
+		t.Fatalf("NewProducer: %v", err)
 	}
 	return prod
+}
+
+func TestProducerNilEmptyAndHashKeys(t *testing.T) {
+	f := &fakeSyncProducer{}
+	p := newTestProducer(t, f, nil)
+	defer p.Close()
+
+	// 1. nil key must produce a true nil sarama.Encoder interface (not typed nil ByteEncoder).
+	if err := p.Publish(context.Background(), "topic-a", nil, []byte("v-nil")); err != nil {
+		t.Fatalf("Publish nil key: %v", err)
+	}
+	// 2. Non-nil empty slice must be preserved as a non-nil Encoder encoding to 0 bytes.
+	if err := p.Publish(context.Background(), "topic-a", []byte{}, []byte("v-empty")); err != nil {
+		t.Fatalf("Publish empty key: %v", err)
+	}
+	// 3. Non-empty key must preserve bytes and partition deterministically with Sarama's hash partitioner.
+	if err := p.Publish(context.Background(), "topic-a", []byte("device-42"), []byte("v-keyed")); err != nil {
+		t.Fatalf("Publish keyed: %v", err)
+	}
+	if err := p.Publish(context.Background(), "topic-a", []byte("device-42"), []byte("v-keyed-2")); err != nil {
+		t.Fatalf("Publish keyed 2: %v", err)
+	}
+
+	msgs := f.sentMessages()
+	if len(msgs) != 4 {
+		t.Fatalf("expected 4 sent messages, got %d", len(msgs))
+	}
+
+	if msgs[0].Key != nil {
+		t.Fatalf("expected nil Key interface for nil byte slice, got %T (%v)", msgs[0].Key, msgs[0].Key)
+	}
+	if msgs[1].Key == nil {
+		t.Fatalf("expected non-nil Key interface for explicit empty []byte{}")
+	}
+	if enc, err := msgs[1].Key.Encode(); err != nil || len(enc) != 0 {
+		t.Fatalf("expected empty encoded key, got len=%d err=%v", len(enc), err)
+	}
+	if enc, err := msgs[2].Key.Encode(); err != nil || string(enc) != "device-42" {
+		t.Fatalf("expected key device-42, got %q err=%v", string(enc), err)
+	}
+
+	// Verify Sarama's default HashPartitioner treats nil key as random and non-nil key as deterministic.
+	part := sarama.NewHashPartitioner("topic-a")
+	const numPartitions = int32(16)
+	nilPartitions := make(map[int32]bool)
+	for i := 0; i < 64; i++ {
+		pIdx, err := part.Partition(msgs[0], numPartitions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nilPartitions[pIdx] = true
+	}
+	if len(nilPartitions) <= 1 {
+		t.Fatalf("expected nil Key to distribute across partitions via random partitioner, got %v", nilPartitions)
+	}
+
+	firstPart, err := part.Partition(msgs[2], numPartitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPart, err := part.Partition(msgs[3], numPartitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstPart != secondPart {
+		t.Fatalf("expected deterministic partition for identical non-nil key, got %d vs %d", firstPart, secondPart)
+	}
 }
 
 func TestProducerContextAndConcurrencyAndClose(t *testing.T) {
@@ -81,8 +164,8 @@ func TestProducerContextAndConcurrencyAndClose(t *testing.T) {
 			t.Fatalf("expected context.DeadlineExceeded, got %v", err)
 		}
 
-		if len(f.sent) != 0 {
-			t.Fatalf("expected 0 sends on cancelled contexts, got %d", len(f.sent))
+		if f.sentCount() != 0 {
+			t.Fatalf("expected 0 sends on cancelled contexts, got %d", f.sentCount())
 		}
 	})
 
@@ -90,7 +173,6 @@ func TestProducerContextAndConcurrencyAndClose(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		f := &fakeSyncProducer{
 			sendFn: func(msg *sarama.ProducerMessage) (int32, int64, error) {
-				// Simulate caller ctx expiring while SendMessage is already in flight.
 				cancel()
 				return 1, 42, nil
 			},
@@ -118,7 +200,8 @@ func TestProducerContextAndConcurrencyAndClose(t *testing.T) {
 		}
 		callerHeaders[0].Value[0] = 'X'
 
-		if string(f.sent[0].Headers[0].Value) != "v1" {
+		msgs := f.sentMessages()
+		if string(msgs[0].Headers[0].Value) != "v1" {
 			t.Fatalf("caller mutation affected sent header")
 		}
 	})
@@ -148,7 +231,6 @@ func TestProducerContextAndConcurrencyAndClose(t *testing.T) {
 		go func() { closeDone <- p.Close() }()
 		go func() { closeDone <- p.Close() }()
 
-		// Close must wait for active SendMessage before closing underlying producer.
 		select {
 		case err := <-closeDone:
 			t.Fatalf("Close returned before active SendMessage completed: %v", err)
@@ -171,6 +253,79 @@ func TestProducerContextAndConcurrencyAndClose(t *testing.T) {
 
 		if err := p.Publish(context.Background(), "topic-a", []byte("k"), []byte("v")); !errors.Is(err, ErrProducerClosed) {
 			t.Fatalf("expected ErrProducerClosed, got %v", err)
+		}
+	})
+
+	t.Run("multiple simultaneous publishers with concurrent Close", func(t *testing.T) {
+		var inFlight atomic.Int32
+		firstStarted := make(chan struct{})
+		var firstOnce sync.Once
+		release := make(chan struct{})
+
+		f := &fakeSyncProducer{
+			sendFn: func(msg *sarama.ProducerMessage) (int32, int64, error) {
+				inFlight.Add(1)
+				firstOnce.Do(func() { close(firstStarted) })
+				<-release
+				inFlight.Add(-1)
+				return 0, 1, nil
+			},
+		}
+		p := newTestProducer(t, f, nil)
+
+		const workers = 16
+		const perWorker = 5
+		var pubWg sync.WaitGroup
+		var succeeded, closedErrs atomic.Int32
+		var unexpectedErr atomic.Value
+
+		for w := 0; w < workers; w++ {
+			pubWg.Add(1)
+			go func(id int) {
+				defer pubWg.Done()
+				for i := 0; i < perWorker; i++ {
+					err := p.Publish(context.Background(), "topic-a", []byte(fmt.Sprintf("k-%d", id)), []byte("v"))
+					if err == nil {
+						succeeded.Add(1)
+					} else if errors.Is(err, ErrProducerClosed) {
+						closedErrs.Add(1)
+					} else {
+						unexpectedErr.Store(err)
+					}
+				}
+			}(w)
+		}
+
+		<-firstStarted
+		var closeWg sync.WaitGroup
+		for c := 0; c < 4; c++ {
+			closeWg.Add(1)
+			go func() {
+				defer closeWg.Done()
+				if err := p.Close(); err != nil {
+					unexpectedErr.Store(err)
+				}
+			}()
+		}
+
+		close(release)
+		closeWg.Wait()
+		pubWg.Wait()
+
+		if v := unexpectedErr.Load(); v != nil {
+			t.Fatalf("unexpected error during concurrent publish/close: %v", v)
+		}
+		if f.closeCnt.Load() != 1 {
+			t.Fatalf("expected single underlying Close, got %d", f.closeCnt.Load())
+		}
+		if succeeded.Load()+closedErrs.Load() != workers*perWorker {
+			t.Fatalf("missing publish outcomes: ok=%d closed=%d", succeeded.Load(), closedErrs.Load())
+		}
+		if int(succeeded.Load()) != f.sentCount() {
+			t.Fatalf("succeeded=%d != sentCount=%d", succeeded.Load(), f.sentCount())
+		}
+		if inFlight.Load() != 0 {
+			t.Fatalf("expected 0 inFlight after Close, got %d", inFlight.Load())
 		}
 	})
 }

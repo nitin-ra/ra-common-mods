@@ -4,12 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"runtime/debug"
 	"time"
 )
 
 // LoggingInterceptor creates an interceptor that logs per-attempt message processing.
 // Successful attempts are logged at Debug level to avoid info-level flooding under high throughput.
+// Only bounded safe failure categories are logged; application error messages and caller logs
+// must avoid secrets or sensitive payloads.
 func LoggingInterceptor(logger *slog.Logger) Interceptor {
 	if logger == nil {
 		logger = slog.Default()
@@ -34,7 +35,7 @@ func LoggingInterceptor(logger *slog.Logger) Interceptor {
 					"offset", msg.Offset,
 					"duration", duration,
 					"outcome", "failure",
-					"error", sanitizeAndBoundErrorString(err.Error(), maxOriginalErrorHeaderLen),
+					"failure_category", classifyFailureCategory(err),
 				)
 			} else {
 				logger.Debug("message attempt processed",
@@ -61,17 +62,14 @@ func RecoveryInterceptor(logger *slog.Logger) Interceptor {
 		return func(ctx context.Context, msg *Message) (err error) {
 			defer func() {
 				if r := recover(); r != nil {
-					stack := string(debug.Stack())
-					if len(stack) > maxPanicStackLen {
-						stack = stack[:maxPanicStackLen] + "..."
-					}
-					err = fmt.Errorf("panic recovered: %v", r)
+					panicErr := newHandlerPanicError(r)
+					err = panicErr
 					logger.Error("panic recovered",
 						"topic", msg.Topic,
 						"partition", msg.Partition,
 						"offset", msg.Offset,
-						"panic", fmt.Sprintf("%v", r),
-						"stack", stack,
+						"failure_category", "handler_panic",
+						"panic_type", fmt.Sprintf("%T", r),
 					)
 				}
 			}()

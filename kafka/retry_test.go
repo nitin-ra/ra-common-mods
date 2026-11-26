@@ -1,8 +1,10 @@
 package kafka
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -35,8 +37,8 @@ func (m *mockDLQProducer) PublishWithHeaders(ctx context.Context, topic string, 
 	m.mu.Lock()
 	m.calls = append(m.calls, mockPublishCall{
 		Topic:   topic,
-		Key:     append([]byte(nil), key...),
-		Value:   append([]byte(nil), value...),
+		Key:     cloneBytesPreserveNil(key),
+		Value:   cloneBytesPreserveNil(value),
 		Headers: cloneHeaders(headers),
 	})
 	fn := m.publishF
@@ -326,8 +328,160 @@ func TestRetryProcessingOutcomes(t *testing.T) {
 			counts[HeaderOriginalConsumerGroup][0] != "test-group" ||
 			counts[HeaderOriginalAttempts][0] != "2" ||
 			counts[HeaderOriginalTimestamp][0] != "2026-11-25T10:00:00Z" ||
-			counts[HeaderOriginalError][0] != "bad payload" {
+			counts[HeaderOriginalError][0] != "handler_error" {
 			t.Fatalf("unexpected DLQ headers: %v", counts)
+		}
+	})
+
+	t.Run("R03 DLQ captures immutable snapshot before handler/interceptor mutations and preserves nil vs empty", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			key       []byte
+			value     []byte
+			hdrVal    []byte
+			wantNilKV bool
+		}{
+			{name: "non-empty slices", key: []byte("orig-key"), value: []byte("orig-val"), hdrVal: []byte("orig-hdr")},
+			{name: "nil slices preserved", key: nil, value: nil, hdrVal: nil, wantNilKV: true},
+			{name: "empty non-nil slices preserved", key: []byte{}, value: []byte{}, hdrVal: []byte{}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var sleeps []time.Duration
+				rt := newNoopRetryRuntime(&sleeps)
+				dlq := &mockDLQProducer{}
+				policy, err := normalizeAndValidateRetryPolicy("orders", &RetryPolicy{
+					Strategy:         RetryStrategyDLQ,
+					MaxRetries:       0,
+					DLQTopic:         "orders-dlq",
+					DLQProducer:      dlq,
+					DLQFailurePolicy: DLQFailureStop,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				ts := time.Date(2026, 11, 26, 8, 30, 0, 0, time.UTC)
+				wantKey := cloneBytesPreserveNil(tc.key)
+				wantVal := cloneBytesPreserveNil(tc.value)
+				msg := &Message{
+					Topic:     "orders",
+					Partition: 4,
+					Offset:    123,
+					Timestamp: ts,
+					Key:       tc.key,
+					Value:     tc.value,
+					Headers:   []RecordHeader{{Key: "x-app", Value: tc.hdrVal}},
+				}
+
+				res := rt.processMessage(context.Background(), msg, func(ctx context.Context, m *Message) error {
+					// Handler mutates every field of m in place before failing.
+					if len(m.Key) > 0 {
+						m.Key[0] = 'X'
+					}
+					if len(m.Value) > 0 {
+						m.Value[0] = 'Y'
+					}
+					if len(m.Headers) > 0 && len(m.Headers[0].Value) > 0 {
+						m.Headers[0].Value[0] = 'Z'
+					}
+					m.Key = []byte("tampered-key")
+					m.Value = []byte("tampered-val")
+					m.Topic = "wrong-topic"
+					m.Partition = 99
+					m.Offset = 999
+					m.Timestamp = time.Time{}
+					m.Headers = []RecordHeader{{Key: "injected", Value: []byte("bad")}}
+					return errors.New("boom")
+				}, policy, time.Second)
+
+				if res.Outcome != outcomeDeadLettered || len(dlq.calls) != 1 {
+					t.Fatalf("expected outcomeDeadLettered, got %+v calls=%d", res, len(dlq.calls))
+				}
+				sent := dlq.calls[0]
+				if tc.wantNilKV {
+					if sent.Key != nil || sent.Value != nil {
+						t.Fatalf("expected nil key/value preserved, got key=%v value=%v", sent.Key, sent.Value)
+					}
+				} else {
+					if sent.Key == nil || sent.Value == nil {
+						t.Fatalf("expected non-nil key/value preserved")
+					}
+					if !bytes.Equal(sent.Key, wantKey) || !bytes.Equal(sent.Value, wantVal) {
+						t.Fatalf("mutated key/value leaked to DLQ: got key=%q val=%q, want key=%q val=%q", sent.Key, sent.Value, wantKey, wantVal)
+					}
+				}
+
+				hdrs := map[string]RecordHeader{}
+				for _, h := range sent.Headers {
+					hdrs[h.Key] = h
+				}
+				if _, injected := hdrs["injected"]; injected {
+					t.Fatalf("handler-injected header leaked into DLQ")
+				}
+				if string(hdrs[HeaderOriginalTopic].Value) != "orders" ||
+					string(hdrs[HeaderOriginalPartition].Value) != "4" ||
+					string(hdrs[HeaderOriginalOffset].Value) != "123" ||
+					string(hdrs[HeaderOriginalTimestamp].Value) != ts.Format(time.RFC3339Nano) {
+					t.Fatalf("mutated metadata leaked into DLQ headers: %+v", hdrs)
+				}
+			})
+		}
+	})
+
+	t.Run("R05 safe diagnostics redact secrets from logs and DLQ while preserving errors.Is", func(t *testing.T) {
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		sentinel := errors.New("db_auth_token=SUPER_SECRET_TOKEN_XYZ")
+		dlq := &mockDLQProducer{}
+
+		rt := &retryRuntime{
+			groupID:  "grp-safe",
+			clientID: "cli-safe",
+			logger:   logger,
+			sleepFn:  func(ctx context.Context, d time.Duration) error { return ctx.Err() },
+			jitterFn: func(d time.Duration) time.Duration { return d },
+		}
+
+		policy, err := normalizeAndValidateRetryPolicy("orders", &RetryPolicy{
+			Strategy:         RetryStrategyDLQ,
+			MaxRetries:       1,
+			InitialDelay:     time.Millisecond,
+			MaxDelay:         time.Millisecond,
+			Multiplier:       1,
+			DLQTopic:         "orders-dlq",
+			DLQProducer:      dlq,
+			DLQFailurePolicy: DLQFailureStop,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var attempt int
+		res := rt.processMessage(context.Background(), baseMsg(), func(ctx context.Context, m *Message) error {
+			attempt++
+			if attempt == 1 {
+				panic(fmt.Errorf("panic wrapping secret: %w", sentinel))
+			}
+			return fmt.Errorf("failed query: %w", sentinel)
+		}, policy, time.Second)
+
+		if res.Outcome != outcomeDeadLettered {
+			t.Fatalf("expected outcomeDeadLettered, got %+v", res)
+		}
+		if !errors.Is(res.Err, sentinel) {
+			t.Fatalf("expected errors.Is(res.Err, sentinel) to remain true, got %v", res.Err)
+		}
+		if strings.Contains(logBuf.String(), "SUPER_SECRET_TOKEN_XYZ") {
+			t.Fatalf("secret leaked into library logs:\n%s", logBuf.String())
+		}
+		var xOrigErr string
+		for _, h := range dlq.calls[0].Headers {
+			if h.Key == HeaderOriginalError {
+				xOrigErr = string(h.Value)
+			}
+		}
+		if strings.Contains(xOrigErr, "SUPER_SECRET_TOKEN_XYZ") || xOrigErr != "handler_error" {
+			t.Fatalf("expected safe category in x-original-error, got %q", xOrigErr)
 		}
 	})
 

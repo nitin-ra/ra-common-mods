@@ -20,6 +20,7 @@ const (
 )
 
 // Message represents a Kafka message with metadata.
+// Handlers and interceptors must treat message slices and metadata fields as read-only.
 type Message struct {
 	// Key is the message key
 	Key []byte
@@ -72,20 +73,42 @@ func (m *Message) SetHeader(key string, value []byte) {
 	m.Headers = append(m.Headers, RecordHeader{Key: key, Value: value})
 }
 
+func cloneBytesPreserveNil(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
+}
+
+func cloneMessageSnapshot(msg *Message) *Message {
+	if msg == nil {
+		return nil
+	}
+	return &Message{
+		Key:       cloneBytesPreserveNil(msg.Key),
+		Value:     cloneBytesPreserveNil(msg.Value),
+		Topic:     msg.Topic,
+		Partition: msg.Partition,
+		Offset:    msg.Offset,
+		Headers:   cloneHeaders(msg.Headers),
+		Timestamp: msg.Timestamp,
+	}
+}
+
 func cloneHeaders(headers []RecordHeader) []RecordHeader {
 	if len(headers) == 0 {
-		return nil
+		if headers == nil {
+			return nil
+		}
+		return []RecordHeader{}
 	}
 	out := make([]RecordHeader, len(headers))
 	for i, h := range headers {
-		var valCopy []byte
-		if h.Value != nil {
-			valCopy = make([]byte, len(h.Value))
-			copy(valCopy, h.Value)
-		}
 		out[i] = RecordHeader{
 			Key:   h.Key,
-			Value: valCopy,
+			Value: cloneBytesPreserveNil(h.Value),
 		}
 	}
 	return out
@@ -122,14 +145,9 @@ func buildDLQHeaders(orig []RecordHeader, meta dlqMetadata) []RecordHeader {
 		if isReservedOriginalHeader(h.Key) {
 			continue
 		}
-		var valCopy []byte
-		if h.Value != nil {
-			valCopy = make([]byte, len(h.Value))
-			copy(valCopy, h.Value)
-		}
 		headers = append(headers, RecordHeader{
 			Key:   h.Key,
-			Value: valCopy,
+			Value: cloneBytesPreserveNil(h.Value),
 		})
 	}
 

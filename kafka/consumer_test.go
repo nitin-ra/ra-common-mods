@@ -827,3 +827,193 @@ func TestConsumerLifecycleCloseAndGracefulShutdown(t *testing.T) {
 		}
 	})
 }
+
+func TestShutdownAdmissionCutoffDeterministic(t *testing.T) {
+	t.Run("R01 graceful shutdown closes gate before stop notification and blocks new admissions", func(t *testing.T) {
+		fg := newFakeConsumerGroup()
+		var capturedSess *fakeSession
+		p0InHandler := make(chan struct{})
+		allowP0Finish := make(chan struct{})
+		p1Claim := newFakeClaim("t1", 1)
+
+		fg.consumeFn = func(runCtx context.Context, topics []string, handler sarama.ConsumerGroupHandler) error {
+			p0Claim := newFakeClaim("t1", 0, &sarama.ConsumerMessage{Topic: "t1", Partition: 0, Offset: 10})
+			var err error
+			capturedSess, err = runFakeSession(runCtx, handler, p0Claim, p1Claim)
+			return err
+		}
+
+		cfg := testConsumerConfig("grp-r01-grace")
+		cfg.ShutdownTimeout = 2 * time.Second
+		gc, err := NewConsumer(testBrokerConfig(), cfg, discardLogger(), func(o *consumerOptions) {
+			o.consumerGroupFactory = func([]string, string, *sarama.Config) (consumerGroupClient, error) { return fg, nil }
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var p0Count, p1Count atomic.Int32
+		if err := gc.Subscribe(Subscription{
+			Topic: "t1",
+			Handler: func(ctx context.Context, msg *Message) error {
+				if msg.Partition == 0 {
+					p0Count.Add(1)
+					close(p0InHandler)
+					<-allowP0Finish
+					return nil
+				}
+				p1Count.Add(1)
+				return nil
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		runDone := make(chan error, 1)
+		go func() { runDone <- gc.Run(context.Background()) }()
+
+		<-p0InHandler
+		cons := gc.(*consumer)
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- gc.Close() }()
+
+		// Deterministic cutoff sync: stopCh closes strictly AFTER gate.CloseAndDrainedCh().
+		<-cons.stopCh
+		if !cons.gate.IsStopping() {
+			t.Fatalf("expected admission gate closed before stopCh closed")
+		}
+		// Feed a message into partition 1 after cutoff; it must never be admitted or marked.
+		p1Claim.msgs <- &sarama.ConsumerMessage{Topic: "t1", Partition: 1, Offset: 99}
+		// Verify direct TryAdmit fails deterministically too.
+		if cons.gate.TryAdmit(context.Background()) {
+			t.Fatalf("expected TryAdmit to fail after gate closure")
+		}
+
+		close(allowP0Finish)
+		if err := <-runDone; err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if err := <-closeDone; err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if p0Count.Load() != 1 || p1Count.Load() != 0 {
+			t.Fatalf("expected p0=1 p1=0, got p0=%d p1=%d", p0Count.Load(), p1Count.Load())
+		}
+		marks, _ := capturedSess.snapshotMarks()
+		if len(marks) != 1 || marks[0].Partition != 0 || marks[0].Offset != 11 {
+			t.Fatalf("expected only p0 offset 11 marked, got %+v", marks)
+		}
+	})
+
+	t.Run("R01 terminal failure closes gate before stop notification and cancels without marking", func(t *testing.T) {
+		fg := newFakeConsumerGroup()
+		var capturedSess *fakeSession
+		p1Claim := newFakeClaim("t1", 1)
+		consumeStarted := make(chan struct{})
+
+		fg.consumeFn = func(runCtx context.Context, topics []string, handler sarama.ConsumerGroupHandler) error {
+			close(consumeStarted)
+			p0Claim := newFakeClaim("t1", 0, &sarama.ConsumerMessage{Topic: "t1", Partition: 0, Offset: 20})
+			var err error
+			capturedSess, err = runFakeSession(runCtx, handler, p0Claim, p1Claim)
+			return err
+		}
+
+		gc, err := NewConsumer(testBrokerConfig(), testConsumerConfig("grp-r01-term"), discardLogger(), func(o *consumerOptions) {
+			o.consumerGroupFactory = func([]string, string, *sarama.Config) (consumerGroupClient, error) { return fg, nil }
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		dlq := &mockDLQProducer{
+			publishF: func(context.Context, string, []byte, []byte, []RecordHeader) error {
+				return errors.New("dlq hard fail")
+			},
+		}
+		var p1Called atomic.Bool
+		if err := gc.Subscribe(Subscription{
+			Topic: "t1",
+			RetryPolicy: &RetryPolicy{
+				Strategy:         RetryStrategyDLQ,
+				MaxRetries:       0,
+				DLQTopic:         "t1-dlq",
+				DLQProducer:      dlq,
+				DLQFailurePolicy: DLQFailureStop,
+			},
+			Handler: func(ctx context.Context, msg *Message) error {
+				if msg.Partition == 1 {
+					p1Called.Store(true)
+				}
+				return errors.New("handler error")
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		runDone := make(chan error, 1)
+		go func() { runDone <- gc.Run(context.Background()) }()
+
+		// Wait deterministically for Consume to start, then for stopCh (closed after gate cutoff).
+		<-consumeStarted
+		cons := gc.(*consumer)
+		<-cons.stopCh
+		if !cons.gate.IsStopping() {
+			t.Fatalf("expected gate closed before stopCh closed on terminal failure")
+		}
+		// Even if a message arrives on partition 1 right at terminal cutoff, it must not be admitted.
+		select {
+		case p1Claim.msgs <- &sarama.ConsumerMessage{Topic: "t1", Partition: 1, Offset: 50}:
+		default:
+		}
+
+		runErr := <-runDone
+		if runErr == nil {
+			t.Fatalf("expected terminal error from Run")
+		}
+		if p1Called.Load() {
+			t.Fatalf("partition 1 must not process message after terminal cutoff")
+		}
+		marks, _ := capturedSess.snapshotMarks()
+		if len(marks) != 0 {
+			t.Fatalf("terminal failure must not mark any unresolved message, got %+v", marks)
+		}
+	})
+}
+
+func TestConsumerStartupFactoryFailureContract(t *testing.T) {
+	// R06: Initial Sarama client creation failure fails fast without startup retry loop.
+	var factoryCalls atomic.Int32
+	startupErr := errors.New("dial tcp 127.0.0.1:9092: connection refused")
+
+	gc, err := NewConsumer(testBrokerConfig(), testConsumerConfig("grp-startup-fail"), discardLogger(), func(o *consumerOptions) {
+		o.consumerGroupFactory = func([]string, string, *sarama.Config) (consumerGroupClient, error) {
+			factoryCalls.Add(1)
+			return nil, startupErr
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gc.Subscribe(Subscription{
+		Topic:   "orders",
+		Handler: func(context.Context, *Message) error { return nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = gc.Run(context.Background())
+	if !errors.Is(err, startupErr) {
+		t.Fatalf("expected wrapped startup error, got %v", err)
+	}
+	if factoryCalls.Load() != 1 {
+		t.Fatalf("expected single fail-fast factory call without retry loop, got %d", factoryCalls.Load())
+	}
+	h := gc.Health()
+	if h.State != ConsumerStateFailed || h.Ready || h.LastError == "" {
+		t.Fatalf("expected Failed, Ready=false, non-empty LastError; got %+v", h)
+	}
+	if closeErr := gc.Close(); closeErr != nil {
+		t.Fatalf("Close after startup failure: %v", closeErr)
+	}
+}

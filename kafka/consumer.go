@@ -30,6 +30,7 @@ type consumer struct {
 	options      consumerOptions
 
 	mu             sync.Mutex
+	readyMetricMu  sync.Mutex
 	state          ConsumerState
 	ready          bool
 	assignedClaims int
@@ -258,7 +259,7 @@ func (c *consumer) Run(ctx context.Context) (runRetErr error) {
 		}
 		c.mu.Unlock()
 
-		c.notifyReady(false)
+		c.publishReadiness()
 
 		if termErr != nil && closeErr != nil {
 			runRetErr = errors.Join(termErr, fmt.Errorf("consumer group close: %w", closeErr))
@@ -354,11 +355,13 @@ func (c *consumer) consumeLoop(
 
 		if err != nil {
 			c.recordError(err, false)
-			c.notifyConsumerError(classifyConsumerError(err))
+			kind := classifyConsumerError(err)
+			c.notifyConsumerError(kind)
 			c.logger.Error("consumer group consume error",
 				"group_id", c.consumerCfg.GroupID,
 				"client_id", c.brokerCfg.ClientID,
-				"error", sanitizeAndBoundErrorString(err.Error(), maxOriginalErrorHeaderLen),
+				"error_class", kind,
+				"failure_category", classifyFailureCategory(err),
 			)
 
 			if isTerminalSaramaError(err) {
@@ -410,7 +413,7 @@ func (c *consumer) drainErrors(errCh <-chan error, done chan<- struct{}) {
 			"group_id", c.consumerCfg.GroupID,
 			"client_id", c.brokerCfg.ClientID,
 			"error_class", kind,
-			"error", sanitizeAndBoundErrorString(err.Error(), maxOriginalErrorHeaderLen),
+			"failure_category", classifyFailureCategory(err),
 		)
 
 		if isTerminalSaramaError(err) {
@@ -431,20 +434,27 @@ func (c *consumer) initiateGracefulShutdown() {
 	c.shutdownOnce.Do(func() {
 		c.gracefulStarted.Store(true)
 		c.mu.Lock()
-		c.stopRequested = true
-		c.ready = false
-		if c.state == ConsumerStateStarting || c.state == ConsumerStateRunning || c.state == ConsumerStateRebalancing {
-			c.state = ConsumerStateDraining
-		}
 		gate := c.gate
 		cancelRun := c.cancelRun
 		consumeExited := c.consumeExited
 		shutdownDone := c.shutdownDone
 		termErr := c.terminalErr
+		c.stopRequested = true
+		c.ready = false
+		if c.state == ConsumerStateStarting || c.state == ConsumerStateRunning || c.state == ConsumerStateRebalancing {
+			c.state = ConsumerStateDraining
+		}
 		c.mu.Unlock()
 
-		c.notifyReady(false)
+		// Close admission gate first as the atomic cutoff before stop notifications,
+		// readiness metric updates, or logging. Never hold c.mu while draining.
+		var drained <-chan struct{}
+		if gate != nil {
+			drained = gate.CloseAndDrainedCh()
+		}
+
 		c.closeStopCh()
+		c.publishReadiness()
 
 		c.logger.Info("consumer group shutting down",
 			"group_id", c.consumerCfg.GroupID,
@@ -452,8 +462,7 @@ func (c *consumer) initiateGracefulShutdown() {
 			"shutdown_timeout", c.consumerCfg.ShutdownTimeout,
 		)
 
-		if gate != nil && termErr == nil {
-			drained := gate.CloseAndDrainedCh()
+		if drained != nil && termErr == nil {
 			timer := time.NewTimer(c.consumerCfg.ShutdownTimeout)
 			select {
 			case <-drained:
@@ -479,24 +488,26 @@ func (c *consumer) initiateGracefulShutdown() {
 
 func (c *consumer) signalTerminalFailure(err error) {
 	c.mu.Lock()
+	gate := c.gate
+	cancelRun := c.cancelRun
 	c.stopRequested = true
 	c.ready = false
 	if c.terminalErr == nil {
 		c.terminalErr = err
 	}
 	if err != nil {
-		c.lastError = sanitizeAndBoundErrorString(err.Error(), maxOriginalErrorHeaderLen)
+		c.lastError = safeConsumerDiagnostic(err)
 		c.lastErrorAt = time.Now()
 	}
-	gate := c.gate
-	cancelRun := c.cancelRun
 	c.mu.Unlock()
 
-	c.notifyReady(false)
-	c.closeStopCh()
+	// Close admission gate first as the atomic cutoff before stop notifications or readiness updates.
 	if gate != nil {
 		gate.CloseAndDrainedCh()
 	}
+
+	c.closeStopCh()
+	c.publishReadiness()
 	if cancelRun != nil {
 		cancelRun(err)
 	}
@@ -513,14 +524,14 @@ func (c *consumer) recordError(err error, preserveReadiness bool) {
 		return
 	}
 	c.mu.Lock()
-	c.lastError = sanitizeAndBoundErrorString(err.Error(), maxOriginalErrorHeaderLen)
+	c.lastError = safeConsumerDiagnostic(err)
 	c.lastErrorAt = time.Now()
 	if !preserveReadiness {
 		c.ready = false
 	}
 	c.mu.Unlock()
 	if !preserveReadiness {
-		c.notifyReady(false)
+		c.publishReadiness()
 	}
 }
 
@@ -611,7 +622,15 @@ func (c *consumer) newRetryRuntime() *retryRuntime {
 	return rt
 }
 
-func (c *consumer) notifyReady(ready bool) {
+func (c *consumer) publishReadiness() {
+	if c.options.metrics == nil {
+		return
+	}
+	c.readyMetricMu.Lock()
+	defer c.readyMetricMu.Unlock()
+	c.mu.Lock()
+	ready := c.ready
+	c.mu.Unlock()
 	c.options.metrics.recordReady(c.consumerCfg.GroupID, ready)
 }
 
@@ -682,7 +701,7 @@ func (h *consumerGroupHandler) Setup(session sarama.ConsumerGroupSession) error 
 	h.assignedClaimsSetLocked(totalClaims, ready)
 	h.consumer.mu.Unlock()
 
-	h.consumer.notifyReady(ready)
+	h.consumer.publishReadiness()
 	h.consumer.logger.Info("consumer group session started",
 		"group_id", h.consumer.consumerCfg.GroupID,
 		"client_id", h.consumer.brokerCfg.ClientID,
@@ -728,7 +747,7 @@ func (h *consumerGroupHandler) Cleanup(session sarama.ConsumerGroupSession) erro
 	}
 	h.consumer.mu.Unlock()
 
-	h.consumer.notifyReady(false)
+	h.consumer.publishReadiness()
 	h.consumer.logger.Info("consumer group session ended",
 		"group_id", h.consumer.consumerCfg.GroupID,
 		"client_id", h.consumer.brokerCfg.ClientID,
@@ -816,14 +835,14 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 
 		case outcomeTerminalFailure:
 			h.consumer.notifyOutcome(topic, res)
-			h.gate.Release()
 			h.consumer.signalTerminalFailure(res.Err)
+			h.gate.Release()
 			return res.Err
 
 		default:
 			invErr := fmt.Errorf("invalid message processing disposition %d", res.Outcome)
-			h.gate.Release()
 			h.consumer.signalTerminalFailure(invErr)
+			h.gate.Release()
 			return invErr
 		}
 	}
@@ -843,14 +862,9 @@ func (h *consumerGroupHandler) updateClaimLag(topic string, partition int32, hwm
 func convertSaramaMessage(msg *sarama.ConsumerMessage) *Message {
 	headers := make([]RecordHeader, len(msg.Headers))
 	for i, hdr := range msg.Headers {
-		var valCopy []byte
-		if hdr.Value != nil {
-			valCopy = make([]byte, len(hdr.Value))
-			copy(valCopy, hdr.Value)
-		}
 		headers[i] = RecordHeader{
 			Key:   string(hdr.Key),
-			Value: valCopy,
+			Value: cloneBytesPreserveNil(hdr.Value),
 		}
 	}
 	return &Message{

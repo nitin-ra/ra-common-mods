@@ -121,8 +121,10 @@ func (p *producer) PublishWithHeaders(ctx context.Context, topic string, key, va
 
 	msg := &sarama.ProducerMessage{
 		Topic: topic,
-		Key:   sarama.ByteEncoder(key),
 		Value: sarama.ByteEncoder(value),
+	}
+	if key != nil {
+		msg.Key = sarama.ByteEncoder(key)
 	}
 	if len(sendHeaders) > 0 {
 		msg.Headers = make([]sarama.RecordHeader, len(sendHeaders))

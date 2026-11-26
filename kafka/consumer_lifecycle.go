@@ -172,6 +172,103 @@ func classifyConsumerError(err error) string {
 	return "transient"
 }
 
+type handlerPanicError struct {
+	typeName string
+	wrapped  error
+}
+
+func newHandlerPanicError(r any) error {
+	pe := &handlerPanicError{
+		typeName: fmt.Sprintf("%T", r),
+	}
+	if err, ok := r.(error); ok {
+		pe.wrapped = err
+	}
+	return pe
+}
+
+func (e *handlerPanicError) Error() string {
+	return "handler panic recovered"
+}
+
+func (e *handlerPanicError) Unwrap() error {
+	return e.wrapped
+}
+
+type dlqPublishError struct {
+	err error
+}
+
+func (e *dlqPublishError) Error() string {
+	return "dlq publication failed"
+}
+
+func (e *dlqPublishError) Unwrap() error {
+	return e.err
+}
+
+func classifyFailureCategory(err error) string {
+	if err == nil {
+		return "none"
+	}
+	var pe *handlerPanicError
+	if errors.As(err, &pe) {
+		return "handler_panic"
+	}
+	var de *dlqPublishError
+	if errors.As(err, &de) {
+		return "dlq_publish_failed"
+	}
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "handler_timeout"
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, ErrProducerClosed):
+		return "producer_closed"
+	case errors.Is(err, sarama.ErrClosedConsumerGroup), errors.Is(err, sarama.ErrClosedClient):
+		return "consumer_closed"
+	}
+	var cfgErr sarama.ConfigurationError
+	if errors.As(err, &cfgErr) {
+		return "configuration_error"
+	}
+	var kerr sarama.KError
+	if errors.As(err, &kerr) {
+		return fmt.Sprintf("kafka_error_%d", int16(kerr))
+	}
+	return "handler_error"
+}
+
+func safeConsumerDiagnostic(err error) string {
+	if err == nil {
+		return ""
+	}
+	class := classifyConsumerError(err)
+	var de *dlqPublishError
+	if errors.As(err, &de) {
+		return class + ": dlq_publish_failed"
+	}
+	var kerr sarama.KError
+	if errors.As(err, &kerr) {
+		return fmt.Sprintf("%s: kafka_error_%d", class, int16(kerr))
+	}
+	var cfgErr sarama.ConfigurationError
+	if errors.As(err, &cfgErr) {
+		return class + ": configuration_error"
+	}
+	switch {
+	case errors.Is(err, sarama.ErrClosedConsumerGroup), errors.Is(err, sarama.ErrClosedClient):
+		return class + ": consumer_closed"
+	case errors.Is(err, context.DeadlineExceeded):
+		return class + ": deadline_exceeded"
+	case errors.Is(err, context.Canceled):
+		return class + ": context_canceled"
+	default:
+		return class + ": consumer_error"
+	}
+}
+
 func formatConsumerError(op string, err error) error {
 	if err == nil {
 		return nil

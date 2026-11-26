@@ -7,7 +7,6 @@ import (
 	"math"
 	"math/rand/v2"
 	"reflect"
-	"runtime/debug"
 	"strings"
 	"time"
 )
@@ -15,7 +14,6 @@ import (
 const (
 	defaultReconnectInitialDelay = 250 * time.Millisecond
 	defaultReconnectMaxDelay     = 5 * time.Second
-	maxPanicStackLen             = 2048
 )
 
 type disposition uint8
@@ -220,10 +218,6 @@ func (rt *retryRuntime) jitter(delay time.Duration) time.Duration {
 func invokeHandlerSafe(ctx context.Context, msg *Message, handler Handler, logger *slog.Logger, groupID, clientID string, attempt int) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			stack := string(debug.Stack())
-			if len(stack) > maxPanicStackLen {
-				stack = stack[:maxPanicStackLen] + "..."
-			}
 			if logger != nil {
 				logger.Error("message handler panicked",
 					"group_id", groupID,
@@ -232,11 +226,11 @@ func invokeHandlerSafe(ctx context.Context, msg *Message, handler Handler, logge
 					"partition", msg.Partition,
 					"offset", msg.Offset,
 					"attempt", attempt,
-					"panic", fmt.Sprintf("%v", r),
-					"stack", stack,
+					"failure_category", "handler_panic",
+					"panic_type", fmt.Sprintf("%T", r),
 				)
 			}
-			err = fmt.Errorf("handler panic: %v", r)
+			err = newHandlerPanicError(r)
 		}
 	}()
 	return handler(ctx, msg)
@@ -251,6 +245,12 @@ func (rt *retryRuntime) processMessage(
 ) processingResult {
 	if err := sessionCtx.Err(); err != nil {
 		return processingResult{Outcome: outcomeInterrupted, Err: err}
+	}
+
+	// Capture an immutable snapshot before any handler/interceptor runs only for DLQ-enabled subscriptions.
+	var dlqSnapshot *Message
+	if policy.Strategy == RetryStrategyDLQ {
+		dlqSnapshot = cloneMessageSnapshot(msg)
 	}
 
 	delay := policy.InitialDelay
@@ -274,7 +274,7 @@ func (rt *retryRuntime) processMessage(
 					"offset", msg.Offset,
 					"attempt", attempts+1,
 					"retry_delay", wait,
-					"error", sanitizeAndBoundErrorString(lastErr.Error(), maxOriginalErrorHeaderLen),
+					"failure_category", classifyFailureCategory(lastErr),
 				)
 			}
 			if rt.onRetry != nil {
@@ -374,7 +374,7 @@ func (rt *retryRuntime) processMessage(
 				"attempt", attempts,
 				"outcome", outcomeDiscarded.String(),
 				"discard_reason", "handler_exhausted",
-				"error", sanitizeAndBoundErrorString(lastErr.Error(), maxOriginalErrorHeaderLen),
+				"failure_category", classifyFailureCategory(lastErr),
 			)
 		}
 		return processingResult{
@@ -385,7 +385,7 @@ func (rt *retryRuntime) processMessage(
 		}
 
 	case RetryStrategyDLQ:
-		return rt.handleDLQ(sessionCtx, msg, policy, lastErr, attempts)
+		return rt.handleDLQ(sessionCtx, dlqSnapshot, policy, lastErr, attempts)
 
 	default:
 		return processingResult{
@@ -403,13 +403,14 @@ func (rt *retryRuntime) handleDLQ(
 	handlerErr error,
 	attempts int,
 ) processingResult {
+	handlerCategory := classifyFailureCategory(handlerErr)
 	dlqHeaders := buildDLQHeaders(msg.Headers, dlqMetadata{
 		Topic:         msg.Topic,
 		Partition:     msg.Partition,
 		Offset:        msg.Offset,
 		Timestamp:     msg.Timestamp,
 		ConsumerGroup: rt.groupID,
-		Error:         handlerErr.Error(),
+		Error:         handlerCategory,
 		Attempts:      attempts,
 	})
 
@@ -471,7 +472,7 @@ func (rt *retryRuntime) handleDLQ(
 					"offset", msg.Offset,
 					"attempt", attempts,
 					"outcome", outcomeDeadLettered.String(),
-					"error", sanitizeAndBoundErrorString(handlerErr.Error(), maxOriginalErrorHeaderLen),
+					"failure_category", handlerCategory,
 				)
 			}
 			return processingResult{
@@ -498,7 +499,7 @@ func (rt *retryRuntime) handleDLQ(
 					"attempt", attempts,
 					"outcome", outcomeDiscarded.String(),
 					"discard_reason", "dlq_failed",
-					"error", sanitizeAndBoundErrorString(dlqErr.Error(), maxOriginalErrorHeaderLen),
+					"failure_category", "dlq_publish_failed",
 				)
 			}
 			return processingResult{
@@ -519,12 +520,12 @@ func (rt *retryRuntime) handleDLQ(
 					"offset", msg.Offset,
 					"attempt", attempts,
 					"outcome", outcomeTerminalFailure.String(),
-					"error", sanitizeAndBoundErrorString(dlqErr.Error(), maxOriginalErrorHeaderLen),
+					"failure_category", "dlq_publish_failed",
 				)
 			}
 			return processingResult{
 				Outcome:  outcomeTerminalFailure,
-				Err:      fmt.Errorf("message retries exhausted (%w) and DLQ publish to %s failed: %w", handlerErr, policy.DLQTopic, dlqErr),
+				Err:      &dlqPublishError{err: fmt.Errorf("message retries exhausted (%w) and DLQ publish to %s failed: %w", handlerErr, policy.DLQTopic, dlqErr)},
 				Attempts: attempts,
 			}
 
@@ -537,7 +538,7 @@ func (rt *retryRuntime) handleDLQ(
 					"dlq_topic", policy.DLQTopic,
 					"partition", msg.Partition,
 					"offset", msg.Offset,
-					"error", sanitizeAndBoundErrorString(dlqErr.Error(), maxOriginalErrorHeaderLen),
+					"failure_category", "dlq_publish_failed",
 				)
 			}
 			continue

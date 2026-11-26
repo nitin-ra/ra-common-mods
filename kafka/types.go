@@ -8,6 +8,9 @@ import (
 // Handler processes a message.
 // Return nil on durable success.
 // Return error on failure so retry policy/logging can handle it.
+// Source message Key, Value, Headers, and metadata (Topic, Partition, Offset, Timestamp)
+// must be treated as read-only by handlers and interceptors.
+// Application error messages and caller-side logs should avoid embedding secrets or sensitive payloads.
 // Handlers registered with Consumer may be invoked concurrently across different partitions
 // and must be safe for concurrent use and idempotent across replays.
 type Handler func(ctx context.Context, msg *Message) error

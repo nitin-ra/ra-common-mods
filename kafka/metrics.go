@@ -19,6 +19,9 @@ type lagKey struct {
 
 // Metrics holds opt-in Prometheus collectors for Kafka producers and consumers.
 // Register collectors explicitly via NewMetrics(reg) using a caller-supplied prometheus.Registerer.
+//
+// Supported instrumentation model: run at most one Consumer member per group_id per process
+// when sharing Metrics, because kafka_consumer_ready is labelled by group_id only.
 type Metrics struct {
 	messagesProcessedTotal   *prometheus.CounterVec
 	messagesFailedTotal      *prometheus.CounterVec
@@ -270,8 +273,8 @@ func (m *Metrics) recordLag(ownerID uint64, groupID, topic string, partition int
 	}
 	key := lagKey{groupID: groupID, topic: topic, partition: partition}
 	m.lagMu.Lock()
+	defer m.lagMu.Unlock()
 	m.lagOwners[key] = ownerID
-	m.lagMu.Unlock()
 	m.consumerLag.WithLabelValues(groupID, topic, strconv.FormatInt(int64(partition), 10)).Set(float64(lag))
 }
 
@@ -281,12 +284,10 @@ func (m *Metrics) cleanupLag(ownerID uint64, groupID, topic string, partition in
 	}
 	key := lagKey{groupID: groupID, topic: topic, partition: partition}
 	m.lagMu.Lock()
+	defer m.lagMu.Unlock()
 	cur, ok := m.lagOwners[key]
 	if ok && cur == ownerID {
 		delete(m.lagOwners, key)
-		m.lagMu.Unlock()
 		m.consumerLag.DeleteLabelValues(groupID, topic, strconv.FormatInt(int64(partition), 10))
-		return
 	}
-	m.lagMu.Unlock()
 }
