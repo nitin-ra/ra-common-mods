@@ -6,13 +6,18 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"strings"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/IBM/sarama"
 )
+
+type topicPartitionKey struct {
+	topic     string
+	partition int32
+}
 
 type compiledSubscription struct {
 	topic          string
@@ -29,15 +34,19 @@ type consumer struct {
 	logger       *slog.Logger
 	options      consumerOptions
 
-	mu             sync.Mutex
-	readyMetricMu  sync.Mutex
-	state          ConsumerState
-	ready          bool
-	assignedClaims int
-	lastError      string
-	lastErrorAt    time.Time
-	lastSessionAt  time.Time
-	lastProcessed  time.Time
+	mu                sync.Mutex
+	readyMetricMu     sync.Mutex
+	state             ConsumerState
+	ready             bool
+	assignedClaims    int
+	activeSessionSeq  uint64
+	expectedClaims    map[topicPartitionKey]struct{}
+	initializedClaims map[topicPartitionKey]struct{}
+	lastError         string
+	lastErrorAt       time.Time
+	lastSessionAt     time.Time
+	lastResolvedAt    time.Time
+	lastSuccessfulAt  time.Time
 
 	subscriptions map[string]compiledSubscription
 	topicOrder    []string
@@ -47,6 +56,8 @@ type consumer struct {
 	gracefulStarted atomic.Bool
 	stopChOnce      sync.Once
 	shutdownOnce    sync.Once
+	teardownArmOnce sync.Once
+	teardownArmed   chan struct{}
 	shutdownDone    chan struct{}
 	consumeExited   chan struct{}
 	stopCh          chan struct{}
@@ -106,8 +117,8 @@ func NewConsumer(brokerCfg BrokerConfig, consumerCfg ConsumerConfig, logger *slo
 // Subscribe registers a topic handler and policy prior to Run.
 // Subscribe performs validation only; no broker I/O or goroutines are started.
 func (c *consumer) Subscribe(sub Subscription) error {
-	if strings.TrimSpace(sub.Topic) == "" {
-		return fmt.Errorf("subscription topic is required")
+	if err := validateTopicName(sub.Topic); err != nil {
+		return fmt.Errorf("invalid subscription topic: %w", err)
 	}
 	if sub.Handler == nil {
 		return fmt.Errorf("subscription handler is required for topic %q", sub.Topic)
@@ -198,24 +209,53 @@ func (c *consumer) Run(ctx context.Context) (runRetErr error) {
 	shutdownDone := make(chan struct{})
 	consumeExited := make(chan struct{})
 	stopCh := make(chan struct{})
+	teardownArmed := make(chan struct{})
 	gate := newAdmissionGate()
 
 	internalBase := context.WithoutCancel(ctx)
 	internalCtx, cancelInternal := context.WithCancelCause(internalBase)
+	abortNetCtx, abortNet := context.WithCancel(context.Background())
 
 	c.runDone = runDone
 	c.shutdownDone = shutdownDone
 	c.consumeExited = consumeExited
 	c.stopCh = stopCh
+	c.teardownArmOnce = sync.Once{}
+	c.teardownArmed = teardownArmed
 	c.gate = gate
 	c.cancelRun = cancelInternal
 	c.mu.Unlock()
+
+	runExiting := make(chan struct{})
+	watchdogDone := make(chan struct{})
+	go func() {
+		defer close(watchdogDone)
+		select {
+		case <-teardownArmed:
+		case <-runExiting:
+			return
+		}
+
+		// Shutdown arms teardown after the drain completes or expires. A claim
+		// can still hold admission while waiting for broker I/O at that point.
+		timer := time.NewTimer(c.consumerCfg.CloseTimeout)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			abortNet()
+			c.logger.Warn("consumer close teardown timeout exceeded; aborting pending broker I/O",
+				"group_id", c.consumerCfg.GroupID,
+				"client_id", c.brokerCfg.ClientID,
+				"close_timeout", c.consumerCfg.CloseTimeout,
+			)
+		case <-runExiting:
+		}
+	}()
 
 	var (
 		drainerDone chan struct{}
 		watcherStop = make(chan struct{})
 		watcherDone = make(chan struct{})
-		watcherOn   bool
 		consumeDone bool
 	)
 
@@ -223,12 +263,11 @@ func (c *consumer) Run(ctx context.Context) (runRetErr error) {
 		if !consumeDone {
 			close(consumeExited)
 		}
-		if watcherOn {
-			close(watcherStop)
-			<-watcherDone
-		}
+		close(watcherStop)
+		<-watcherDone
 
 		cancelInternal(errGracefulShutdown)
+		c.armTeardown()
 
 		c.mu.Lock()
 		client := c.client
@@ -238,6 +277,10 @@ func (c *consumer) Run(ctx context.Context) (runRetErr error) {
 		if client != nil {
 			closeErr = client.Close()
 		}
+
+		close(runExiting)
+		<-watchdogDone
+		abortNet()
 
 		if drainerDone != nil {
 			<-drainerDone
@@ -250,6 +293,8 @@ func (c *consumer) Run(ctx context.Context) (runRetErr error) {
 		termErr := c.terminalErr
 		c.ready = false
 		c.assignedClaims = 0
+		c.expectedClaims = nil
+		c.initializedClaims = nil
 		if c.state != ConsumerStateClosed {
 			if termErr != nil || closeErr != nil {
 				c.state = ConsumerStateFailed
@@ -272,6 +317,15 @@ func (c *consumer) Run(ctx context.Context) (runRetErr error) {
 		close(runDone)
 	}()
 
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-ctx.Done():
+			c.initiateGracefulShutdown()
+		case <-watcherStop:
+		}
+	}()
+
 	if c.isStopRequested() || ctx.Err() != nil {
 		return nil
 	}
@@ -284,11 +338,32 @@ func (c *consumer) Run(ctx context.Context) (runRetErr error) {
 	}
 
 	scCopy := *c.saramaConfig
+	if !scCopy.Net.Proxy.Enable {
+		baseDialer := &net.Dialer{
+			Timeout:   scCopy.Net.DialTimeout,
+			KeepAlive: scCopy.Net.KeepAlive,
+			LocalAddr: scCopy.Net.LocalAddr,
+		}
+		scCopy.Net.Proxy.Enable = true
+		scCopy.Net.Proxy.Dialer = &cancelableDialer{
+			ctx:    abortNetCtx,
+			dialer: baseDialer,
+		}
+	}
+	metadataBackoff := scCopy.Metadata.Retry.Backoff
+	scCopy.Metadata.Retry.BackoffFunc = func(_, _ int) time.Duration {
+		if abortNetCtx.Err() != nil {
+			// Once the watchdog closes the sockets, retries cannot reconnect.
+			return 0
+		}
+		return metadataBackoff
+	}
 	client, err := factory(brokers, c.consumerCfg.GroupID, &scCopy)
 	if err != nil {
-		termErr := formatConsumerError("failed to create consumer group", err)
-		c.signalTerminalFailure(termErr)
-		return nil // runRetErr set in defer
+		if ctx.Err() == nil && !c.isStopRequested() {
+			c.signalTerminalFailure(formatConsumerError("failed to create consumer group", err))
+		}
+		return nil
 	}
 
 	c.mu.Lock()
@@ -302,16 +377,6 @@ func (c *consumer) Run(ctx context.Context) (runRetErr error) {
 	if stopNow {
 		return nil
 	}
-
-	watcherOn = true
-	go func() {
-		defer close(watcherDone)
-		select {
-		case <-ctx.Done():
-			c.initiateGracefulShutdown()
-		case <-watcherStop:
-		}
-	}()
 
 	groupHandler := &consumerGroupHandler{
 		consumer:   c,
@@ -355,7 +420,11 @@ func (c *consumer) consumeLoop(
 
 		if err != nil {
 			c.recordError(err, false)
+			resetInvalid := c.consumerCfg.ResetInvalidOffsets
 			kind := classifyConsumerError(err)
+			if isTerminalErrorForConsumer(err, resetInvalid) {
+				kind = "terminal"
+			}
 			c.notifyConsumerError(kind)
 			c.logger.Error("consumer group consume error",
 				"group_id", c.consumerCfg.GroupID,
@@ -364,7 +433,7 @@ func (c *consumer) consumeLoop(
 				"failure_category", classifyFailureCategory(err),
 			)
 
-			if isTerminalSaramaError(err) {
+			if isTerminalErrorForConsumer(err, resetInvalid) {
 				c.signalTerminalFailure(formatConsumerError("terminal consumer error", err))
 				return
 			}
@@ -393,6 +462,7 @@ func (c *consumer) consumeLoop(
 
 func (c *consumer) drainErrors(errCh <-chan error, done chan<- struct{}) {
 	defer close(done)
+	resetInvalid := c.consumerCfg.ResetInvalidOffsets
 	for err := range errCh {
 		if err == nil {
 			continue
@@ -401,6 +471,9 @@ func (c *consumer) drainErrors(errCh <-chan error, done chan<- struct{}) {
 			c.notifyCommitError()
 		}
 		kind := classifyConsumerError(err)
+		if isTerminalErrorForConsumer(err, resetInvalid) {
+			kind = "terminal"
+		}
 		c.notifyConsumerError(kind)
 
 		// Do not treat expected closed-group errors during shutdown as an unexpected failure.
@@ -409,17 +482,30 @@ func (c *consumer) drainErrors(errCh <-chan error, done chan<- struct{}) {
 		}
 
 		c.recordError(err, true)
-		c.logger.Error("consumer group reported error",
+		logArgs := []any{
 			"group_id", c.consumerCfg.GroupID,
 			"client_id", c.brokerCfg.ClientID,
 			"error_class", kind,
 			"failure_category", classifyFailureCategory(err),
-		)
+		}
+		var ce *sarama.ConsumerError
+		if errors.As(err, &ce) {
+			logArgs = append(logArgs, "topic", ce.Topic, "partition", ce.Partition)
+		}
+		c.logger.Error("consumer group reported error", logArgs...)
 
-		if isTerminalSaramaError(err) {
+		if isTerminalErrorForConsumer(err, resetInvalid) {
 			c.signalTerminalFailure(formatConsumerError("terminal consumer error", err))
 		}
 	}
+}
+
+func (c *consumer) armTeardown() {
+	c.teardownArmOnce.Do(func() {
+		if c.teardownArmed != nil {
+			close(c.teardownArmed)
+		}
+	})
 }
 
 func (c *consumer) closeStopCh() {
@@ -480,6 +566,7 @@ func (c *consumer) initiateGracefulShutdown() {
 		if cancelRun != nil {
 			cancelRun(errGracefulShutdown)
 		}
+		c.armTeardown()
 		if shutdownDone != nil {
 			close(shutdownDone)
 		}
@@ -496,7 +583,7 @@ func (c *consumer) signalTerminalFailure(err error) {
 		c.terminalErr = err
 	}
 	if err != nil {
-		c.lastError = safeConsumerDiagnostic(err)
+		c.lastError = safeConsumerDiagnosticForConsumer(err, c.consumerCfg.ResetInvalidOffsets)
 		c.lastErrorAt = time.Now()
 	}
 	c.mu.Unlock()
@@ -511,6 +598,7 @@ func (c *consumer) signalTerminalFailure(err error) {
 	if cancelRun != nil {
 		cancelRun(err)
 	}
+	c.armTeardown()
 }
 
 func (c *consumer) isStopRequested() bool {
@@ -524,7 +612,7 @@ func (c *consumer) recordError(err error, preserveReadiness bool) {
 		return
 	}
 	c.mu.Lock()
-	c.lastError = safeConsumerDiagnostic(err)
+	c.lastError = safeConsumerDiagnosticForConsumer(err, c.consumerCfg.ResetInvalidOffsets)
 	c.lastErrorAt = time.Now()
 	if !preserveReadiness {
 		c.ready = false
@@ -539,13 +627,14 @@ func (c *consumer) Health() ConsumerHealth {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return ConsumerHealth{
-		State:           c.state,
-		Ready:           c.ready,
-		AssignedClaims:  c.assignedClaims,
-		LastError:       c.lastError,
-		LastErrorAt:     c.lastErrorAt,
-		LastSessionAt:   c.lastSessionAt,
-		LastProcessedAt: c.lastProcessed,
+		State:            c.state,
+		Ready:            c.ready,
+		AssignedClaims:   c.assignedClaims,
+		LastError:        c.lastError,
+		LastErrorAt:      c.lastErrorAt,
+		LastSessionAt:    c.lastSessionAt,
+		LastResolvedAt:   c.lastResolvedAt,
+		LastSuccessfulAt: c.lastSuccessfulAt,
 	}
 }
 
@@ -670,6 +759,7 @@ type consumerGroupHandler struct {
 	commitMode CommitMode
 
 	sessionEstablished atomic.Bool
+	currentSessionSeq  atomic.Uint64
 	commitMu           sync.Mutex
 	hasMarked          atomic.Bool
 }
@@ -686,20 +776,21 @@ func (h *consumerGroupHandler) Setup(session sarama.ConsumerGroupSession) error 
 	h.sessionEstablished.Store(true)
 	h.hasMarked.Store(false)
 
-	totalClaims := 0
-	for _, parts := range session.Claims() {
-		totalClaims += len(parts)
+	expected := make(map[topicPartitionKey]struct{})
+	for topic, parts := range session.Claims() {
+		for _, p := range parts {
+			expected[topicPartitionKey{topic: topic, partition: p}] = struct{}{}
+		}
 	}
+	totalClaims := len(expected)
 
 	sessionNum := h.consumer.sessionCounter.Add(1)
 	if sessionNum > 1 {
 		h.consumer.notifyRebalance()
 	}
 
-	h.consumer.mu.Lock()
-	ready := !h.consumer.stopRequested && h.consumer.terminalErr == nil
-	h.assignedClaimsSetLocked(totalClaims, ready)
-	h.consumer.mu.Unlock()
+	seq := h.consumer.setupSessionClaims(expected)
+	h.currentSessionSeq.Store(seq)
 
 	h.consumer.publishReadiness()
 	h.consumer.logger.Info("consumer group session started",
@@ -712,17 +803,66 @@ func (h *consumerGroupHandler) Setup(session sarama.ConsumerGroupSession) error 
 	return nil
 }
 
-func (c *consumer) assignedClaimsSetLocked(claims int, ready bool) {
-	c.assignedClaims = claims
-	c.ready = ready
+func (c *consumer) setupSessionClaims(expected map[topicPartitionKey]struct{}) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.activeSessionSeq++
+	seq := c.activeSessionSeq
+	c.expectedClaims = expected
+	c.initializedClaims = make(map[topicPartitionKey]struct{}, len(expected))
+	c.assignedClaims = len(expected)
 	c.lastSessionAt = time.Now()
-	if ready {
+
+	canBeReady := !c.stopRequested && c.terminalErr == nil &&
+		c.state != ConsumerStateClosed && c.state != ConsumerStateDraining &&
+		c.state != ConsumerStateFailed && c.state != ConsumerStateStopped
+
+	if len(expected) == 0 && canBeReady {
+		c.ready = true
 		c.state = ConsumerStateRunning
+	} else {
+		c.ready = false
+		if c.state == ConsumerStateRunning {
+			c.state = ConsumerStateRebalancing
+		}
 	}
+	return seq
 }
 
-func (h *consumerGroupHandler) assignedClaimsSetLocked(claims int, ready bool) {
-	h.consumer.assignedClaimsSetLocked(claims, ready)
+func (c *consumer) markClaimInitialized(seq uint64, topic string, partition int32) {
+	c.mu.Lock()
+	if seq == 0 || seq != c.activeSessionSeq {
+		c.mu.Unlock()
+		return
+	}
+	key := topicPartitionKey{topic: topic, partition: partition}
+	if _, expected := c.expectedClaims[key]; !expected {
+		c.mu.Unlock()
+		return
+	}
+	if c.initializedClaims == nil {
+		c.initializedClaims = make(map[topicPartitionKey]struct{}, len(c.expectedClaims))
+	}
+	c.initializedClaims[key] = struct{}{}
+
+	canBeReady := !c.stopRequested && c.terminalErr == nil &&
+		c.state != ConsumerStateClosed && c.state != ConsumerStateDraining &&
+		c.state != ConsumerStateFailed && c.state != ConsumerStateStopped
+
+	becameReady := false
+	if canBeReady && len(c.initializedClaims) >= len(c.expectedClaims) {
+		if !c.ready || c.state != ConsumerStateRunning {
+			c.ready = true
+			c.state = ConsumerStateRunning
+			becameReady = true
+		}
+	}
+	c.mu.Unlock()
+
+	if becameReady {
+		c.publishReadiness()
+	}
 }
 
 func (h *consumerGroupHandler) Cleanup(session sarama.ConsumerGroupSession) error {
@@ -740,6 +880,9 @@ func (h *consumerGroupHandler) Cleanup(session sarama.ConsumerGroupSession) erro
 	}
 
 	h.consumer.mu.Lock()
+	h.consumer.activeSessionSeq++
+	h.consumer.expectedClaims = nil
+	h.consumer.initializedClaims = nil
 	h.consumer.assignedClaims = 0
 	h.consumer.ready = false
 	if h.consumer.state == ConsumerStateRunning {
@@ -769,7 +912,12 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 		return err
 	}
 
+	h.consumer.markClaimInitialized(h.currentSessionSeq.Load(), topic, partition)
+
 	rt := h.consumer.newRetryRuntime()
+	rt.onAttemptStart = func(m *Message) {
+		h.updateClaimLag(topic, partition, claim.HighWaterMarkOffset(), m.Offset)
+	}
 	h.updateClaimLag(topic, partition, claim.HighWaterMarkOffset(), claim.InitialOffset())
 
 	for {
@@ -826,8 +974,12 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 				session.Commit()
 				h.commitMu.Unlock()
 			}
+			now := time.Now()
 			h.consumer.mu.Lock()
-			h.consumer.lastProcessed = time.Now()
+			h.consumer.lastResolvedAt = now
+			if res.Outcome == outcomeProcessed {
+				h.consumer.lastSuccessfulAt = now
+			}
 			h.consumer.mu.Unlock()
 			h.consumer.notifyOutcome(topic, res)
 			h.updateClaimLag(topic, partition, claim.HighWaterMarkOffset(), msg.Offset+1)

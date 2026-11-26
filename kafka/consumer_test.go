@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -209,25 +211,31 @@ func TestSubscriptionValidationAndMultiTopicIsolation(t *testing.T) {
 		defer gc.Close()
 
 		noop := func(context.Context, *Message) error { return nil }
-		if err := gc.Subscribe(Subscription{Topic: "", Handler: noop}); err == nil {
+		if err := gc.Subscribe(Subscription{Topic: "", Handler: noop, RetryPolicy: DefaultRetryPolicy()}); err == nil {
 			t.Fatalf("expected error for empty topic")
 		}
-		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: nil}); err == nil {
+		if err := gc.Subscribe(Subscription{Topic: "a/b", Handler: noop, RetryPolicy: DefaultRetryPolicy()}); err == nil {
+			t.Fatalf("expected error for invalid topic name")
+		}
+		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: nil, RetryPolicy: DefaultRetryPolicy()}); err == nil {
 			t.Fatalf("expected error for nil handler")
 		}
-		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: noop, Interceptors: []Interceptor{nil}}); err == nil {
+		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: noop, RetryPolicy: nil}); err == nil {
+			t.Fatalf("expected error for nil retry policy")
+		}
+		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: noop, RetryPolicy: DefaultRetryPolicy(), Interceptors: []Interceptor{nil}}); err == nil {
 			t.Fatalf("expected error for nil interceptor")
 		}
-		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: noop, HandlerTimeout: -time.Millisecond}); err == nil {
+		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: noop, RetryPolicy: DefaultRetryPolicy(), HandlerTimeout: -time.Millisecond}); err == nil {
 			t.Fatalf("expected error for negative handler timeout")
 		}
 		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: noop, RetryPolicy: &RetryPolicy{Strategy: "bogus"}}); err == nil {
 			t.Fatalf("expected error for invalid retry policy")
 		}
-		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: noop}); err != nil {
+		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: noop, RetryPolicy: DefaultRetryPolicy()}); err != nil {
 			t.Fatalf("valid subscription failed: %v", err)
 		}
-		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: noop}); err == nil {
+		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: noop, RetryPolicy: DefaultRetryPolicy()}); err == nil {
 			t.Fatalf("expected error for duplicate topic")
 		}
 		if factoryCalls.Load() != 0 {
@@ -364,7 +372,8 @@ func TestCommitModesAndUnresolvedFailures(t *testing.T) {
 
 		var count atomic.Int32
 		if err := gc.Subscribe(Subscription{
-			Topic: "orders",
+			Topic:       "orders",
+			RetryPolicy: DefaultRetryPolicy(),
 			Handler: func(ctx context.Context, msg *Message) error {
 				if count.Add(1) == 2 {
 					cancel()
@@ -473,7 +482,8 @@ func TestCommitModesAndUnresolvedFailures(t *testing.T) {
 
 		var called atomic.Bool
 		if err := gc.Subscribe(Subscription{
-			Topic: "expected-topic",
+			Topic:       "expected-topic",
+			RetryPolicy: DefaultRetryPolicy(),
 			Handler: func(context.Context, *Message) error {
 				called.Store(true)
 				return nil
@@ -521,7 +531,7 @@ func TestConsumerLifecycleCloseAndGracefulShutdown(t *testing.T) {
 			t.Fatalf("expected state Registered after ErrNoSubscriptions, got %s", gc.Health().State)
 		}
 
-		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: func(context.Context, *Message) error { return nil }}); err != nil {
+		if err := gc.Subscribe(Subscription{Topic: "t1", RetryPolicy: DefaultRetryPolicy(), Handler: func(context.Context, *Message) error { return nil }}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -530,7 +540,7 @@ func TestConsumerLifecycleCloseAndGracefulShutdown(t *testing.T) {
 		go func() { runErrCh <- gc.Run(ctx) }()
 
 		<-started
-		if err := gc.Subscribe(Subscription{Topic: "t2", Handler: func(context.Context, *Message) error { return nil }}); !errors.Is(err, ErrConsumerAlreadyRunning) {
+		if err := gc.Subscribe(Subscription{Topic: "t2", RetryPolicy: DefaultRetryPolicy(), Handler: func(context.Context, *Message) error { return nil }}); !errors.Is(err, ErrConsumerAlreadyRunning) {
 			t.Fatalf("expected ErrConsumerAlreadyRunning on late Subscribe, got %v", err)
 		}
 		if err := gc.Run(context.Background()); !errors.Is(err, ErrConsumerAlreadyRunning) {
@@ -590,7 +600,7 @@ func TestConsumerLifecycleCloseAndGracefulShutdown(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: func(context.Context, *Message) error { return nil }}); err != nil {
+		if err := gc.Subscribe(Subscription{Topic: "t1", RetryPolicy: DefaultRetryPolicy(), Handler: func(context.Context, *Message) error { return nil }}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -650,7 +660,8 @@ func TestConsumerLifecycleCloseAndGracefulShutdown(t *testing.T) {
 		var processed []int64
 		var mu sync.Mutex
 		if err := gc.Subscribe(Subscription{
-			Topic: "t1",
+			Topic:       "t1",
+			RetryPolicy: DefaultRetryPolicy(),
 			Handler: func(ctx context.Context, msg *Message) error {
 				close(p1Started)
 				<-p1AllowFinish
@@ -718,7 +729,8 @@ func TestConsumerLifecycleCloseAndGracefulShutdown(t *testing.T) {
 
 		var calls atomic.Int32
 		if err := gc.Subscribe(Subscription{
-			Topic: "t1",
+			Topic:       "t1",
+			RetryPolicy: DefaultRetryPolicy(),
 			Handler: func(ctx context.Context, msg *Message) error {
 				calls.Add(1)
 				close(started)
@@ -786,7 +798,7 @@ func TestConsumerLifecycleCloseAndGracefulShutdown(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := gc.Subscribe(Subscription{Topic: "t1", Handler: func(context.Context, *Message) error { return nil }}); err != nil {
+		if err := gc.Subscribe(Subscription{Topic: "t1", RetryPolicy: DefaultRetryPolicy(), Handler: func(context.Context, *Message) error { return nil }}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -854,7 +866,8 @@ func TestShutdownAdmissionCutoffDeterministic(t *testing.T) {
 
 		var p0Count, p1Count atomic.Int32
 		if err := gc.Subscribe(Subscription{
-			Topic: "t1",
+			Topic:       "t1",
+			RetryPolicy: DefaultRetryPolicy(),
 			Handler: func(ctx context.Context, msg *Message) error {
 				if msg.Partition == 0 {
 					p0Count.Add(1)
@@ -996,8 +1009,9 @@ func TestConsumerStartupFactoryFailureContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := gc.Subscribe(Subscription{
-		Topic:   "orders",
-		Handler: func(context.Context, *Message) error { return nil },
+		Topic:       "orders",
+		RetryPolicy: DefaultRetryPolicy(),
+		Handler:     func(context.Context, *Message) error { return nil },
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1016,4 +1030,446 @@ func TestConsumerStartupFactoryFailureContract(t *testing.T) {
 	if closeErr := gc.Close(); closeErr != nil {
 		t.Fatalf("Close after startup failure: %v", closeErr)
 	}
+}
+
+func stalledBrokerListener(t *testing.T) *net.TCPListener {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	if err := listener.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	return listener
+}
+
+func TestConsumerShutdownDuringBrokerStartup(t *testing.T) {
+	listener := stalledBrokerListener(t)
+	broker := testBrokerConfig()
+	broker.Brokers = []string{listener.Addr().String()}
+	broker.ReadTimeout = 5 * time.Second
+	cfg := testConsumerConfig("startup-cancel")
+	cfg.CloseTimeout = 25 * time.Millisecond
+	gc, err := NewConsumer(broker, cfg, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gc.Subscribe(Subscription{
+		Topic:       "orders",
+		Handler:     func(context.Context, *Message) error { return nil },
+		RetryPolicy: DefaultRetryPolicy(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- gc.Run(ctx) }()
+	conn, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Keep the broker socket open and silent until Run finishes.
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run after startup cancellation: %v", err)
+		}
+	case <-time.After(400 * time.Millisecond):
+		t.Fatalf("Run did not exit promptly after startup cancellation: %+v", gc.Health())
+	}
+	if health := gc.Health(); health.State != ConsumerStateStopped || health.Ready || health.LastError != "" {
+		t.Fatalf("expected a clean stop after startup cancellation, got %+v", health)
+	}
+}
+
+type blockingCommitSession struct {
+	*fakeSession
+	commit func()
+}
+
+func (s *blockingCommitSession) Commit() { s.commit() }
+
+func TestConsumerCloseDuringStalledSyncCommit(t *testing.T) {
+	listener := stalledBrokerListener(t)
+	fg := newFakeConsumerGroup()
+	commitStarted := make(chan struct{})
+	cfg := testConsumerConfig("commit-stall")
+	cfg.CommitMode = CommitSync
+	cfg.ShutdownTimeout = 25 * time.Millisecond
+	cfg.CloseTimeout = 25 * time.Millisecond
+	gc, err := NewConsumer(testBrokerConfig(), cfg, discardLogger(), func(o *consumerOptions) {
+		o.consumerGroupFactory = func(_ []string, _ string, sc *sarama.Config) (consumerGroupClient, error) {
+			conn, err := sc.Net.Proxy.Dialer.Dial("tcp", listener.Addr().String())
+			if err != nil {
+				return nil, err
+			}
+			fg.consumeFn = func(ctx context.Context, _ []string, handler sarama.ConsumerGroupHandler) error {
+				defer conn.Close()
+				var firstCommit sync.Once
+				session := &blockingCommitSession{
+					fakeSession: newFakeSession(ctx, map[string][]int32{"orders": {0}}),
+					commit: func() {
+						firstCommit.Do(func() {
+							close(commitStarted)
+							_, _ = io.Copy(io.Discard, conn)
+						})
+					},
+				}
+				if err := handler.Setup(session); err != nil {
+					return err
+				}
+				claim := newFakeClaim("orders", 0, &sarama.ConsumerMessage{Topic: "orders"})
+				if err := handler.ConsumeClaim(session, claim); err != nil {
+					return err
+				}
+				return handler.Cleanup(session)
+			}
+			return fg, nil
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gc.Subscribe(Subscription{
+		Topic:       "orders",
+		Handler:     func(context.Context, *Message) error { return nil },
+		RetryPolicy: DefaultRetryPolicy(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- gc.Run(ctx) }()
+	peer, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	select {
+	case <-commitStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("claim did not reach the synchronous commit")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- gc.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close after stalled commit: %v", err)
+		}
+	case <-time.After(400 * time.Millisecond):
+		t.Fatal("Close remained blocked after the shutdown and teardown timeouts")
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("Run after stalled commit: %v", err)
+	}
+}
+
+func TestReadinessClaimInitializationAndHealthTimestamps(t *testing.T) {
+	t.Run("F04 readiness waits for all assigned claims to enter ConsumeClaim even on idle partitions", func(t *testing.T) {
+		fg := newFakeConsumerGroup()
+		setupDone := make(chan struct{})
+		p0Entered := make(chan struct{})
+		allowP1Start := make(chan struct{})
+		p1Entered := make(chan struct{})
+		allowSessionExit := make(chan struct{})
+
+		fg.consumeFn = func(runCtx context.Context, topics []string, handler sarama.ConsumerGroupHandler) error {
+			sess := newFakeSession(runCtx, map[string][]int32{"t1": {0, 1}})
+			if err := handler.Setup(sess); err != nil {
+				return err
+			}
+			close(setupDone)
+
+			// Idle claims (no messages sent) still mark readiness once ConsumeClaim begins.
+			c0 := newFakeClaim("t1", 0)
+			c1 := newFakeClaim("t1", 1)
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				close(p0Entered)
+				_ = handler.ConsumeClaim(sess, c0)
+			}()
+			go func() {
+				defer wg.Done()
+				<-allowP1Start
+				close(p1Entered)
+				_ = handler.ConsumeClaim(sess, c1)
+			}()
+
+			<-allowSessionExit
+			<-runCtx.Done()
+			wg.Wait()
+			return handler.Cleanup(sess)
+		}
+
+		gc, err := NewConsumer(testBrokerConfig(), testConsumerConfig("grp-f04"), discardLogger(), func(o *consumerOptions) {
+			o.consumerGroupFactory = func([]string, string, *sarama.Config) (consumerGroupClient, error) { return fg, nil }
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := gc.Subscribe(Subscription{
+			Topic:       "t1",
+			RetryPolicy: DefaultRetryPolicy(),
+			Handler:     func(context.Context, *Message) error { return nil },
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		runDone := make(chan error, 1)
+		go func() { runDone <- gc.Run(ctx) }()
+
+		<-setupDone
+		// Immediately after Setup with 2 assigned claims, Ready must still be false.
+		if h := gc.Health(); h.Ready || h.AssignedClaims != 2 {
+			t.Fatalf("expected Ready=false and AssignedClaims=2 right after Setup, got %+v", h)
+		}
+
+		// After only 1 of 2 claims enters ConsumeClaim, Ready must still be false.
+		<-p0Entered
+		time.Sleep(15 * time.Millisecond)
+		if h := gc.Health(); h.Ready {
+			t.Fatalf("expected Ready=false while claim 1 is not yet initialized, got %+v", h)
+		}
+
+		// Once claim 1 enters ConsumeClaim (even with zero messages), Ready becomes true.
+		close(allowP1Start)
+		<-p1Entered
+		deadline := time.Now().Add(2 * time.Second)
+		for !gc.Health().Ready {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for Ready=true after all claims initialized, got %+v", gc.Health())
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		close(allowSessionExit)
+		cancel()
+		if err := <-runDone; err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if gc.Health().Ready {
+			t.Fatalf("expected Ready=false after shutdown")
+		}
+	})
+
+	t.Run("F09 LastResolvedAt vs LastSuccessfulAt distinguish discard/DLQ from business success", func(t *testing.T) {
+		fg := newFakeConsumerGroup()
+		fg.consumeFn = func(runCtx context.Context, topics []string, handler sarama.ConsumerGroupHandler) error {
+			c := newFakeClaim("t1", 0,
+				&sarama.ConsumerMessage{Topic: "t1", Partition: 0, Offset: 1, Value: []byte("discard")},
+				&sarama.ConsumerMessage{Topic: "t1", Partition: 0, Offset: 2, Value: []byte("ok")},
+			)
+			_, err := runFakeSession(runCtx, handler, c)
+			return err
+		}
+
+		gc, err := NewConsumer(testBrokerConfig(), testConsumerConfig("grp-f09"), discardLogger(), func(o *consumerOptions) {
+			o.consumerGroupFactory = func([]string, string, *sarama.Config) (consumerGroupClient, error) { return fg, nil }
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var snapAfterDiscard ConsumerHealth
+		ctx, cancel := context.WithCancel(context.Background())
+		var step atomic.Int32
+		if err := gc.Subscribe(Subscription{
+			Topic:       "t1",
+			RetryPolicy: &RetryPolicy{Strategy: RetryStrategyLogAndIgnore, MaxRetries: 0},
+			Handler: func(c context.Context, msg *Message) error {
+				if step.Add(1) == 1 {
+					return errors.New("fail first")
+				}
+				// Captured right before msg 2 resolves: msg 1 was discarded, so LastResolvedAt is set, LastSuccessfulAt is zero.
+				snapAfterDiscard = gc.Health()
+				go cancel()
+				return nil
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := gc.Run(ctx); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if snapAfterDiscard.LastResolvedAt.IsZero() || !snapAfterDiscard.LastSuccessfulAt.IsZero() {
+			t.Fatalf("after discard expected LastResolvedAt non-zero and LastSuccessfulAt zero, got %+v", snapAfterDiscard)
+		}
+		finalH := gc.Health()
+		if finalH.LastResolvedAt.IsZero() || finalH.LastSuccessfulAt.IsZero() {
+			t.Fatalf("after success expected both LastResolvedAt and LastSuccessfulAt set, got %+v", finalH)
+		}
+	})
+}
+
+func TestInvalidOffsetFailClosedAndRetryStopAndShutdownBound(t *testing.T) {
+	t.Run("F05 ResetInvalidOffsets=false fails fast on ErrOffsetOutOfRange instead of looping", func(t *testing.T) {
+		fg := newFakeConsumerGroup()
+		var consumeCalls atomic.Int32
+		fg.consumeFn = func(runCtx context.Context, topics []string, handler sarama.ConsumerGroupHandler) error {
+			consumeCalls.Add(1)
+			fg.errCh <- &sarama.ConsumerError{Topic: "t1", Partition: 0, Err: sarama.ErrOffsetOutOfRange}
+			<-runCtx.Done()
+			return nil
+		}
+
+		cfg := testConsumerConfig("grp-f05")
+		cfg.ResetInvalidOffsets = false
+		gc, err := NewConsumer(testBrokerConfig(), cfg, discardLogger(), func(o *consumerOptions) {
+			o.consumerGroupFactory = func([]string, string, *sarama.Config) (consumerGroupClient, error) { return fg, nil }
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := gc.Subscribe(Subscription{
+			Topic:       "t1",
+			RetryPolicy: DefaultRetryPolicy(),
+			Handler:     func(context.Context, *Message) error { return nil },
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		err = gc.Run(context.Background())
+		if !errors.Is(err, sarama.ErrOffsetOutOfRange) {
+			t.Fatalf("expected ErrOffsetOutOfRange, got %v", err)
+		}
+		if consumeCalls.Load() != 1 {
+			t.Fatalf("expected single Consume without rebalance loop, got %d", consumeCalls.Load())
+		}
+		if h := gc.Health(); h.State != ConsumerStateFailed || h.Ready {
+			t.Fatalf("expected Failed/unready health, got %+v", h)
+		}
+	})
+
+	t.Run("F07_F08 RetryStrategyStop and Permanent under Infinite stop without marking", func(t *testing.T) {
+		for _, tc := range []struct {
+			name        string
+			policy      *RetryPolicy
+			err         error
+			wantOffsets []int64
+		}{
+			{
+				name:        "RetryStrategyStop",
+				policy:      &RetryPolicy{Strategy: RetryStrategyStop, MaxRetries: 1, InitialDelay: time.Millisecond, MaxDelay: time.Millisecond, Multiplier: 1},
+				err:         errors.New("transient exhausted"),
+				wantOffsets: []int64{10, 10},
+			},
+			{
+				name:        "Infinite+Permanent",
+				policy:      &RetryPolicy{Strategy: RetryStrategyInfinite},
+				err:         Permanent(errors.New("bad payload")),
+				wantOffsets: []int64{10},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				fg := newFakeConsumerGroup()
+				var capturedSess *fakeSession
+				fg.consumeFn = func(runCtx context.Context, topics []string, handler sarama.ConsumerGroupHandler) error {
+					c := newFakeClaim("orders", 0,
+						&sarama.ConsumerMessage{Topic: "orders", Partition: 0, Offset: 10},
+						&sarama.ConsumerMessage{Topic: "orders", Partition: 0, Offset: 11},
+					)
+					var err error
+					capturedSess, err = runFakeSession(runCtx, handler, c)
+					return err
+				}
+				gc, err := NewConsumer(testBrokerConfig(), testConsumerConfig("grp-"+tc.name), discardLogger(), func(o *consumerOptions) {
+					o.consumerGroupFactory = func([]string, string, *sarama.Config) (consumerGroupClient, error) { return fg, nil }
+					o.sleepFn = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+					o.jitterFn = func(d time.Duration) time.Duration { return d }
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var seenOffsets []int64
+				if err := gc.Subscribe(Subscription{
+					Topic:       "orders",
+					RetryPolicy: tc.policy,
+					Handler: func(ctx context.Context, msg *Message) error {
+						seenOffsets = append(seenOffsets, msg.Offset)
+						return tc.err
+					},
+				}); err != nil {
+					t.Fatal(err)
+				}
+				runErr := gc.Run(context.Background())
+				if !errors.Is(runErr, tc.err) {
+					t.Fatalf("expected error %v from Run, got %v", tc.err, runErr)
+				}
+				if !slices.Equal(seenOffsets, tc.wantOffsets) {
+					t.Fatalf("expected offsets %v processed (never offset 11), got %v", tc.wantOffsets, seenOffsets)
+				}
+				marks, _ := capturedSess.snapshotMarks()
+				if len(marks) != 0 {
+					t.Fatalf("failed offset must not be marked, got %+v", marks)
+				}
+			})
+		}
+	})
+
+	t.Run("F01 repeated shutdowns under stalled CloseTimeout bound exit and leak zero goroutines", func(t *testing.T) {
+		// Warm up any background stdlib goroutines before taking baseline.
+		baseline := runtime.NumGoroutine()
+		for i := 0; i < 5; i++ {
+			fg := newFakeConsumerGroup()
+			consumed := make(chan struct{})
+			fg.consumeFn = func(runCtx context.Context, topics []string, handler sarama.ConsumerGroupHandler) error {
+				close(consumed)
+				<-runCtx.Done()
+				return nil
+			}
+			cfg := testConsumerConfig(fmt.Sprintf("grp-repeat-%d", i))
+			cfg.ShutdownTimeout = 20 * time.Millisecond
+			cfg.CloseTimeout = 30 * time.Millisecond
+			gc, err := NewConsumer(testBrokerConfig(), cfg, discardLogger(), func(o *consumerOptions) {
+				o.consumerGroupFactory = func([]string, string, *sarama.Config) (consumerGroupClient, error) { return fg, nil }
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := gc.Subscribe(Subscription{
+				Topic:       "t1",
+				RetryPolicy: DefaultRetryPolicy(),
+				Handler:     func(context.Context, *Message) error { return nil },
+			}); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- gc.Run(ctx) }()
+			<-consumed
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatalf("iter %d Run: %v", i, err)
+			}
+			if err := gc.Close(); err != nil {
+				t.Fatalf("iter %d Close: %v", i, err)
+			}
+		}
+
+		// Allow scheduler to settle and verify no goroutine growth.
+		deadline := time.Now().Add(time.Second)
+		for runtime.NumGoroutine() > baseline+2 && time.Now().Before(deadline) {
+			runtime.Gosched()
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := runtime.NumGoroutine(); got > baseline+2 {
+			t.Fatalf("goroutine leak suspected after repeated shutdowns: baseline=%d current=%d", baseline, got)
+		}
+	})
 }

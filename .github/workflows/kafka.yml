@@ -73,10 +73,10 @@ jobs:
 
       - name: Start pinned Apache Kafka KRaft broker
         run: |
-          docker run -d --name kafka-local -p 19092:9092 \
+          docker run -d --name kafka-local -p 19092:19092 \
             -e KAFKA_NODE_ID=1 \
             -e KAFKA_PROCESS_ROLES=broker,controller \
-            -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+            -e KAFKA_LISTENERS=PLAINTEXT://:19092,CONTROLLER://:9093 \
             -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:19092 \
             -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
             -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
@@ -89,7 +89,7 @@ jobs:
             apache/kafka:3.7.2
 
           for attempt in $(seq 1 60); do
-            if docker exec kafka-local /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1; then
+            if docker exec kafka-local /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 >/dev/null 2>&1; then
               echo "Kafka broker ready on attempt $attempt"
               exit 0
             fi

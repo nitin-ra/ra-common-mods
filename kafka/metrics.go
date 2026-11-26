@@ -33,6 +33,7 @@ type Metrics struct {
 	publishDurationSeconds   *prometheus.HistogramVec
 	publishErrorsTotal       *prometheus.CounterVec
 	consumerLag              *prometheus.GaugeVec
+	backlogUpdatedAt         *prometheus.GaugeVec
 	commitAttemptsTotal      *prometheus.CounterVec
 	commitErrorsTotal        *prometheus.CounterVec
 	consumerErrorsTotal      *prometheus.CounterVec
@@ -90,8 +91,12 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 			Help: "Total number of Kafka publish failures.",
 		}, []string{"topic", "reason"}),
 		consumerLag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "kafka_consumer_lag",
-			Help: "Observed partition processing backlog (high-water mark minus next ack-eligible offset).",
+			Name: "kafka_consumer_in_process_backlog",
+			Help: "Observed in-process partition backlog for locally claimed partitions (Sarama high-water mark minus next ack-eligible offset; not authoritative broker-committed group lag).",
+		}, []string{"group_id", "topic", "partition"}),
+		backlogUpdatedAt: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "kafka_consumer_backlog_updated_timestamp_seconds",
+			Help: "Unix timestamp in seconds when the observed in-process partition backlog was last updated.",
 		}, []string{"group_id", "topic", "partition"}),
 		commitAttemptsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kafka_commit_attempts_total",
@@ -127,6 +132,7 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 		m.publishDurationSeconds,
 		m.publishErrorsTotal,
 		m.consumerLag,
+		m.backlogUpdatedAt,
 		m.commitAttemptsTotal,
 		m.commitErrorsTotal,
 		m.consumerErrorsTotal,
@@ -271,23 +277,28 @@ func (m *Metrics) recordLag(ownerID uint64, groupID, topic string, partition int
 	if lag < 0 {
 		lag = 0
 	}
+	partStr := strconv.FormatInt(int64(partition), 10)
 	key := lagKey{groupID: groupID, topic: topic, partition: partition}
+	nowSec := float64(time.Now().UnixNano()) / 1e9
 	m.lagMu.Lock()
 	defer m.lagMu.Unlock()
 	m.lagOwners[key] = ownerID
-	m.consumerLag.WithLabelValues(groupID, topic, strconv.FormatInt(int64(partition), 10)).Set(float64(lag))
+	m.consumerLag.WithLabelValues(groupID, topic, partStr).Set(float64(lag))
+	m.backlogUpdatedAt.WithLabelValues(groupID, topic, partStr).Set(nowSec)
 }
 
 func (m *Metrics) cleanupLag(ownerID uint64, groupID, topic string, partition int32) {
 	if m == nil {
 		return
 	}
+	partStr := strconv.FormatInt(int64(partition), 10)
 	key := lagKey{groupID: groupID, topic: topic, partition: partition}
 	m.lagMu.Lock()
 	defer m.lagMu.Unlock()
 	cur, ok := m.lagOwners[key]
 	if ok && cur == ownerID {
 		delete(m.lagOwners, key)
-		m.consumerLag.DeleteLabelValues(groupID, topic, strconv.FormatInt(int64(partition), 10))
+		m.consumerLag.DeleteLabelValues(groupID, topic, partStr)
+		m.backlogUpdatedAt.DeleteLabelValues(groupID, topic, partStr)
 	}
 }

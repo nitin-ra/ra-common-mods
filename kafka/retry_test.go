@@ -80,14 +80,29 @@ func TestRetryPolicyValidation(t *testing.T) {
 	})
 	defer zeroAcksProd.Close()
 
-	// Nil policy resolves to documented default copy.
-	p1, err := normalizeAndValidateRetryPolicy("src", nil)
+	// Nil policy is explicitly rejected (F03); DefaultRetryPolicy() remains available as explicit opt-in.
+	if _, err := normalizeAndValidateRetryPolicy("src", nil); err == nil {
+		t.Fatalf("expected nil retry policy to be rejected")
+	}
+	if _, err := normalizeAndValidateRetryPolicy("src", &RetryPolicy{MaxRetries: 2}); err == nil {
+		t.Fatalf("expected empty retry strategy to be rejected")
+	}
+	p1, err := normalizeAndValidateRetryPolicy("src", DefaultRetryPolicy())
 	if err != nil {
-		t.Fatalf("nil policy failed: err=%v", err)
+		t.Fatalf("DefaultRetryPolicy failed: err=%v", err)
 	}
 	if p1.Strategy != RetryStrategyLogAndIgnore || p1.MaxRetries != 3 ||
 		p1.InitialDelay != 100*time.Millisecond || p1.MaxDelay != 30*time.Second || p1.Multiplier != 2.0 {
 		t.Fatalf("unexpected default retry policy: %+v", p1)
+	}
+
+	// RetryStrategyStop is valid without DLQ fields (F07).
+	pStop, err := normalizeAndValidateRetryPolicy("src", &RetryPolicy{Strategy: RetryStrategyStop, MaxRetries: 2})
+	if err != nil {
+		t.Fatalf("RetryStrategyStop failed validation: %v", err)
+	}
+	if pStop.Strategy != RetryStrategyStop || pStop.MaxRetries != 2 {
+		t.Fatalf("unexpected stop policy: %+v", pStop)
 	}
 
 	// Explicit zero MaxRetries must NOT be overwritten to 3.
@@ -138,6 +153,11 @@ func TestRetryPolicyValidation(t *testing.T) {
 			name:    "dlq missing topic",
 			policy:  &RetryPolicy{Strategy: RetryStrategyDLQ, DLQProducer: validDLQ, DLQFailurePolicy: DLQFailureDiscard},
 			wantErr: "DLQ topic",
+		},
+		{
+			name:    "dlq invalid topic characters",
+			policy:  &RetryPolicy{Strategy: RetryStrategyDLQ, DLQTopic: "orders/dlq", DLQProducer: validDLQ, DLQFailurePolicy: DLQFailureDiscard},
+			wantErr: "invalid DLQ topic",
 		},
 		{
 			name:    "dlq self topic rejected",
@@ -678,6 +698,118 @@ func TestRetryProcessingOutcomes(t *testing.T) {
 		}, policy, time.Second)
 		if res.Outcome != outcomeProcessed || calls != 2 {
 			t.Fatalf("expected panic to be recovered and retried to success, got calls=%d res=%+v", calls, res)
+		}
+	})
+
+	t.Run("F07 bounded RetryStrategyStop exhausts attempts and returns terminal failure", func(t *testing.T) {
+		var sleeps []time.Duration
+		rt := newNoopRetryRuntime(&sleeps)
+		policy, err := normalizeAndValidateRetryPolicy("orders", &RetryPolicy{
+			Strategy:     RetryStrategyStop,
+			MaxRetries:   2,
+			InitialDelay: 5 * time.Millisecond,
+			MaxDelay:     time.Second,
+			Multiplier:   2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sentinel := errors.New("db unavailable")
+		var calls int
+		res := rt.processMessage(context.Background(), baseMsg(), func(context.Context, *Message) error {
+			calls++
+			return sentinel
+		}, policy, time.Second)
+
+		if res.Outcome != outcomeTerminalFailure || calls != 3 || len(sleeps) != 2 || !errors.Is(res.Err, sentinel) {
+			t.Fatalf("unexpected stop result: %+v calls=%d sleeps=%v", res, calls, sleeps)
+		}
+	})
+
+	t.Run("F08 Permanent error skips retries and applies strategy disposition", func(t *testing.T) {
+		if Permanent(nil) != nil {
+			t.Fatalf("Permanent(nil) must return nil")
+		}
+		rootErr := errors.New("malformed json")
+		permErr := Permanent(rootErr)
+		if !errors.Is(permErr, rootErr) {
+			t.Fatalf("Permanent must preserve wrapped error for errors.Is")
+		}
+
+		// Ignore -> immediate discard
+		{
+			var sleeps []time.Duration
+			rt := newNoopRetryRuntime(&sleeps)
+			policy, _ := normalizeAndValidateRetryPolicy("orders", &RetryPolicy{
+				Strategy:   RetryStrategyLogAndIgnore,
+				MaxRetries: 5,
+			})
+			var calls int
+			res := rt.processMessage(context.Background(), baseMsg(), func(context.Context, *Message) error {
+				calls++
+				return permErr
+			}, policy, time.Second)
+			if res.Outcome != outcomeDiscarded || res.DiscardReason != "permanent_error" || calls != 1 || len(sleeps) != 0 {
+				t.Fatalf("ignore+Permanent: got %+v calls=%d sleeps=%v", res, calls, sleeps)
+			}
+		}
+
+		// DLQ -> immediate DLQ publish
+		{
+			var sleeps []time.Duration
+			rt := newNoopRetryRuntime(&sleeps)
+			dlq := &mockDLQProducer{}
+			policy, _ := normalizeAndValidateRetryPolicy("orders", &RetryPolicy{
+				Strategy:         RetryStrategyDLQ,
+				MaxRetries:       5,
+				DLQTopic:         "orders-dlq",
+				DLQProducer:      dlq,
+				DLQFailurePolicy: DLQFailureStop,
+			})
+			var calls int
+			res := rt.processMessage(context.Background(), baseMsg(), func(context.Context, *Message) error {
+				calls++
+				return permErr
+			}, policy, time.Second)
+			if res.Outcome != outcomeDeadLettered || calls != 1 || len(sleeps) != 0 || len(dlq.calls) != 1 {
+				t.Fatalf("dlq+Permanent: got %+v calls=%d sleeps=%v dlq=%d", res, calls, sleeps, len(dlq.calls))
+			}
+		}
+
+		// Stop -> immediate terminal failure
+		{
+			var sleeps []time.Duration
+			rt := newNoopRetryRuntime(&sleeps)
+			policy, _ := normalizeAndValidateRetryPolicy("orders", &RetryPolicy{
+				Strategy:   RetryStrategyStop,
+				MaxRetries: 5,
+			})
+			var calls int
+			res := rt.processMessage(context.Background(), baseMsg(), func(context.Context, *Message) error {
+				calls++
+				return permErr
+			}, policy, time.Second)
+			if res.Outcome != outcomeTerminalFailure || calls != 1 || len(sleeps) != 0 || !errors.Is(res.Err, rootErr) {
+				t.Fatalf("stop+Permanent: got %+v calls=%d sleeps=%v", res, calls, sleeps)
+			}
+		}
+
+		// Infinite -> stop without acknowledging rather than looping forever
+		{
+			var sleeps []time.Duration
+			rt := newNoopRetryRuntime(&sleeps)
+			policy, _ := normalizeAndValidateRetryPolicy("orders", &RetryPolicy{
+				Strategy: RetryStrategyInfinite,
+			})
+			var calls int
+			res := rt.processMessage(context.Background(), baseMsg(), func(context.Context, *Message) error {
+				calls++
+				return permErr
+			}, policy, time.Second)
+			if res.Outcome != outcomeTerminalFailure || calls != 1 || len(sleeps) != 0 || !errors.Is(res.Err, rootErr) {
+				t.Fatalf("infinite+Permanent: got %+v calls=%d sleeps=%v", res, calls, sleeps)
+			}
 		}
 	})
 }

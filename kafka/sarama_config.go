@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/IBM/sarama"
 )
@@ -133,6 +134,21 @@ func buildProducerSaramaConfig(broker BrokerConfig, producer ProducerConfig) (*s
 		sc.Net.MaxOpenRequests = 1
 	}
 
+	switch producer.Partitioner {
+	case "", "hash":
+		sc.Producer.Partitioner = sarama.NewHashPartitioner
+	case "crc32":
+		sc.Producer.Partitioner = sarama.NewConsistentCRCHashPartitioner
+	case "murmur2":
+		sc.Producer.Partitioner = sarama.NewMurmur2Partitioner
+	case "roundrobin":
+		sc.Producer.Partitioner = sarama.NewRoundRobinPartitioner
+	case "random":
+		sc.Producer.Partitioner = sarama.NewRandomPartitioner
+	default:
+		return nil, fmt.Errorf("unsupported producer partitioner: %s", producer.Partitioner)
+	}
+
 	if err := sc.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid sarama producer config: %w", err)
 	}
@@ -171,8 +187,30 @@ func buildConsumerSaramaConfig(broker BrokerConfig, consumer ConsumerConfig) (*s
 	sc.Consumer.Group.Session.Timeout = consumer.SessionTimeout
 	sc.Consumer.Group.Heartbeat.Interval = consumer.HeartbeatInterval
 	sc.Consumer.Group.Rebalance.Timeout = consumer.RebalanceTimeout
+	sc.Consumer.Group.ResetInvalidOffsets = consumer.ResetInvalidOffsets
+	switch consumer.IsolationLevel {
+	case "", IsolationReadUncommitted:
+		sc.Consumer.IsolationLevel = sarama.ReadUncommitted
+	case IsolationReadCommitted:
+		sc.Consumer.IsolationLevel = sarama.ReadCommitted
+	default:
+		return nil, fmt.Errorf("unsupported isolation level: %s", consumer.IsolationLevel)
+	}
 	sc.Consumer.MaxProcessingTime = consumer.MaxProcessingTime
 	sc.Consumer.Return.Errors = true
+
+	// Bound metadata and shutdown-time offset commit retries so unresponsive brokers
+	// cannot multiply socket timeouts across excessive retry loops.
+	metadataTimeout := broker.ReadTimeout * 2
+	if metadataTimeout < 2*time.Second {
+		metadataTimeout = 2 * time.Second
+	}
+	if metadataTimeout > 15*time.Second {
+		metadataTimeout = 15 * time.Second
+	}
+	sc.Metadata.Timeout = metadataTimeout
+	sc.Metadata.Retry.Max = 2
+	sc.Consumer.Offsets.Retry.Max = 1
 
 	switch consumer.CommitMode {
 	case CommitPeriodic:

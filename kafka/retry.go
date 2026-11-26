@@ -2,14 +2,44 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"math/rand/v2"
 	"reflect"
-	"strings"
 	"time"
 )
+
+type permanentError struct {
+	err error
+}
+
+func (e *permanentError) Error() string {
+	return e.err.Error()
+}
+
+func (e *permanentError) Unwrap() error {
+	return e.err
+}
+
+// Permanent marks err as non-retryable so the consumer skips further handler retries
+// and immediately applies the subscription's failure disposition.
+// Calling Permanent(nil) returns nil.
+func Permanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &permanentError{err: err}
+}
+
+func isPermanentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pe *permanentError
+	return errors.As(err, &pe)
+}
 
 const (
 	defaultReconnectInitialDelay = 250 * time.Millisecond
@@ -65,12 +95,12 @@ func isNilInterface(v any) bool {
 
 func normalizeAndValidateRetryPolicy(sourceTopic string, policy *RetryPolicy) (RetryPolicy, error) {
 	if policy == nil {
-		return *DefaultRetryPolicy(), nil
+		return RetryPolicy{}, fmt.Errorf("retry policy must be explicitly configured (use DefaultRetryPolicy() for bounded retries with discard)")
 	}
 
 	p := *policy
 	if p.Strategy == "" {
-		p.Strategy = RetryStrategyLogAndIgnore
+		return RetryPolicy{}, fmt.Errorf("retry policy strategy must be specified")
 	}
 	if p.MaxRetries < 0 {
 		return RetryPolicy{}, fmt.Errorf("retry policy max_retries cannot be negative")
@@ -108,18 +138,16 @@ func normalizeAndValidateRetryPolicy(sourceTopic string, policy *RetryPolicy) (R
 	}
 
 	switch p.Strategy {
-	case RetryStrategyLogAndIgnore, RetryStrategyInfinite:
+	case RetryStrategyLogAndIgnore, RetryStrategyInfinite, RetryStrategyStop:
 		return p, nil
 
 	case RetryStrategyDLQ:
-		dlqTopic := strings.TrimSpace(p.DLQTopic)
-		if dlqTopic == "" {
-			return RetryPolicy{}, fmt.Errorf("DLQ topic must be specified for DLQ retry strategy")
+		if err := validateTopicName(p.DLQTopic); err != nil {
+			return RetryPolicy{}, fmt.Errorf("invalid DLQ topic: %w", err)
 		}
-		if dlqTopic == sourceTopic {
-			return RetryPolicy{}, fmt.Errorf("DLQ topic %q cannot be identical to source topic", dlqTopic)
+		if p.DLQTopic == sourceTopic {
+			return RetryPolicy{}, fmt.Errorf("DLQ topic %q cannot be identical to source topic", p.DLQTopic)
 		}
-		p.DLQTopic = dlqTopic
 		if isNilInterface(p.DLQProducer) {
 			return RetryPolicy{}, fmt.Errorf("DLQ producer must be specified for DLQ retry strategy")
 		}
@@ -182,16 +210,17 @@ func nextBackoffDelay(current, maxDelay time.Duration, multiplier float64) time.
 }
 
 type retryRuntime struct {
-	groupID       string
-	clientID      string
-	logger        *slog.Logger
-	sleepFn       func(ctx context.Context, d time.Duration) error
-	jitterFn      func(delay time.Duration) time.Duration
-	onAttemptFail func(topic string)
-	onRetry       func(topic string)
-	onAttemptDone func(topic string, duration time.Duration, outcome string)
-	onDLQAttempt  func(sourceTopic string, success bool)
-	startAttempt  func(ctx context.Context, msg *Message, attempt int) (context.Context, func(error))
+	groupID        string
+	clientID       string
+	logger         *slog.Logger
+	sleepFn        func(ctx context.Context, d time.Duration) error
+	jitterFn       func(delay time.Duration) time.Duration
+	onAttemptStart func(msg *Message)
+	onAttemptFail  func(topic string)
+	onRetry        func(topic string)
+	onAttemptDone  func(topic string, duration time.Duration, outcome string)
+	onDLQAttempt   func(sourceTopic string, success bool)
+	startAttempt   func(ctx context.Context, msg *Message, attempt int) (context.Context, func(error))
 }
 
 func (rt *retryRuntime) sleep(ctx context.Context, d time.Duration) error {
@@ -218,6 +247,7 @@ func (rt *retryRuntime) jitter(delay time.Duration) time.Duration {
 func invokeHandlerSafe(ctx context.Context, msg *Message, handler Handler, logger *slog.Logger, groupID, clientID string, attempt int) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			pe := newHandlerPanicError(r).(*handlerPanicError)
 			if logger != nil {
 				logger.Error("message handler panicked",
 					"group_id", groupID,
@@ -227,10 +257,11 @@ func invokeHandlerSafe(ctx context.Context, msg *Message, handler Handler, logge
 					"offset", msg.Offset,
 					"attempt", attempt,
 					"failure_category", "handler_panic",
-					"panic_type", fmt.Sprintf("%T", r),
+					"panic_type", pe.typeName,
+					"panic_frames", pe.frames,
 				)
 			}
-			err = newHandlerPanicError(r)
+			err = pe
 		}
 	}()
 	return handler(ctx, msg)
@@ -257,6 +288,7 @@ func (rt *retryRuntime) processMessage(
 	retriesUsed := 0
 	attempts := 0
 	var lastErr error
+	permanent := false
 
 	for {
 		if err := sessionCtx.Err(); err != nil {
@@ -291,6 +323,9 @@ func (rt *retryRuntime) processMessage(
 		}
 
 		attempts++
+		if rt.onAttemptStart != nil {
+			rt.onAttemptStart(msg)
+		}
 		attemptCtx, attemptCancel := context.WithTimeout(sessionCtx, handlerTimeout)
 		var endTrace func(error)
 		if rt.startAttempt != nil {
@@ -351,21 +386,32 @@ func (rt *retryRuntime) processMessage(
 			rt.onAttemptDone(msg.Topic, duration, "failure")
 		}
 
+		if isPermanentError(err) {
+			permanent = true
+			break
+		}
+
 		if policy.Strategy != RetryStrategyInfinite && retriesUsed >= policy.MaxRetries {
 			break
 		}
 		retriesUsed++
 	}
 
-	// Handler retries exhausted; execute post-exhaustion strategy.
+	// Handler retries exhausted (or permanent error); execute post-exhaustion strategy.
 	if err := sessionCtx.Err(); err != nil {
 		return processingResult{Outcome: outcomeInterrupted, Err: err, Attempts: attempts}
 	}
 
 	switch policy.Strategy {
 	case RetryStrategyLogAndIgnore:
+		discardReason := "handler_exhausted"
+		logMsg := "message processing failed after retries; discarding message"
+		if permanent {
+			discardReason = "permanent_error"
+			logMsg = "message processing failed with permanent error; discarding message"
+		}
 		if rt.logger != nil {
-			rt.logger.Error("message processing failed after retries; discarding message",
+			rt.logger.Error(logMsg,
 				"group_id", rt.groupID,
 				"client_id", rt.clientID,
 				"topic", msg.Topic,
@@ -373,19 +419,58 @@ func (rt *retryRuntime) processMessage(
 				"offset", msg.Offset,
 				"attempt", attempts,
 				"outcome", outcomeDiscarded.String(),
-				"discard_reason", "handler_exhausted",
+				"discard_reason", discardReason,
 				"failure_category", classifyFailureCategory(lastErr),
 			)
 		}
 		return processingResult{
 			Outcome:       outcomeDiscarded,
-			DiscardReason: "handler_exhausted",
+			DiscardReason: discardReason,
 			Err:           lastErr,
 			Attempts:      attempts,
 		}
 
 	case RetryStrategyDLQ:
 		return rt.handleDLQ(sessionCtx, dlqSnapshot, policy, lastErr, attempts)
+
+	case RetryStrategyStop:
+		if rt.logger != nil {
+			rt.logger.Error("message processing failed; stopping consumer per policy",
+				"group_id", rt.groupID,
+				"client_id", rt.clientID,
+				"topic", msg.Topic,
+				"partition", msg.Partition,
+				"offset", msg.Offset,
+				"attempt", attempts,
+				"outcome", outcomeTerminalFailure.String(),
+				"failure_category", classifyFailureCategory(lastErr),
+			)
+		}
+		return processingResult{
+			Outcome:  outcomeTerminalFailure,
+			Err:      fmt.Errorf("message processing stopped after %d attempts on %s/%d@%d: %w", attempts, msg.Topic, msg.Partition, msg.Offset, lastErr),
+			Attempts: attempts,
+		}
+
+	case RetryStrategyInfinite:
+		// Reached only on permanent error so infinite retry does not wedge a partition forever.
+		if rt.logger != nil {
+			rt.logger.Error("permanent error under infinite retry policy; stopping consumer without acknowledging",
+				"group_id", rt.groupID,
+				"client_id", rt.clientID,
+				"topic", msg.Topic,
+				"partition", msg.Partition,
+				"offset", msg.Offset,
+				"attempt", attempts,
+				"outcome", outcomeTerminalFailure.String(),
+				"failure_category", classifyFailureCategory(lastErr),
+			)
+		}
+		return processingResult{
+			Outcome:  outcomeTerminalFailure,
+			Err:      fmt.Errorf("permanent failure under infinite retry policy on %s/%d@%d: %w", msg.Topic, msg.Partition, msg.Offset, lastErr),
+			Attempts: attempts,
+		}
 
 	default:
 		return processingResult{
@@ -432,7 +517,10 @@ func (rt *retryRuntime) handleDLQ(
 					"dlq_topic", policy.DLQTopic,
 					"partition", msg.Partition,
 					"offset", msg.Offset,
+					"attempt", attempts,
+					"dlq_attempt", dlqAttempt+1,
 					"retry_delay", wait,
+					"failure_category", handlerCategory,
 				)
 			}
 			if err := rt.sleep(sessionCtx, wait); err != nil {

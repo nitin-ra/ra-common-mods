@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -92,8 +91,8 @@ func (p *producer) PublishWithHeaders(ctx context.Context, topic string, key, va
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if strings.TrimSpace(topic) == "" {
-		return fmt.Errorf("topic is required")
+	if err := validateTopicName(topic); err != nil {
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		p.metrics.recordPublish(topic, 0, err)
@@ -160,8 +159,8 @@ func (p *producer) PublishJSON(ctx context.Context, topic string, key string, da
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if strings.TrimSpace(topic) == "" {
-		return fmt.Errorf("topic is required")
+	if err := validateTopicName(topic); err != nil {
+		return err
 	}
 
 	value, err := json.Marshal(data)

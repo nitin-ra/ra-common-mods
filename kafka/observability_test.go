@@ -172,14 +172,14 @@ func TestMetricsOptInAndAccuracy(t *testing.T) {
 		t.Fatalf("consumerReady after Run = %v, want 0", got)
 	}
 
-	// Verify stale lag series was removed on Cleanup.
+	// Verify stale backlog series was removed on Cleanup.
 	families, err := reg.Gather()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, fam := range families {
-		if fam.GetName() == "kafka_consumer_lag" && len(fam.GetMetric()) > 0 {
-			t.Fatalf("expected kafka_consumer_lag series to be cleaned up on Cleanup, still has %d", len(fam.GetMetric()))
+		if (fam.GetName() == "kafka_consumer_in_process_backlog" || fam.GetName() == "kafka_consumer_backlog_updated_timestamp_seconds") && len(fam.GetMetric()) > 0 {
+			t.Fatalf("expected %s series to be cleaned up on Cleanup, still has %d", fam.GetName(), len(fam.GetMetric()))
 		}
 	}
 }
@@ -391,6 +391,37 @@ func TestOpenTelemetryTracingAndDisabledMode(t *testing.T) {
 	}
 }
 
+func TestTracingInterceptorRecordsPanic(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+	panicValue := errors.New("private panic details")
+	handler := NewTracingInterceptor(TracingConfig{TracerProvider: tp})(func(context.Context, *Message) error {
+		panic(panicValue)
+	})
+
+	err := invokeHandlerSafe(context.Background(), &Message{Topic: "orders"}, handler, nil, "group", "client", 1)
+	if !errors.Is(err, panicValue) {
+		t.Fatalf("expected consumer to recover the original panic, got %v", err)
+	}
+	spans := recorder.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("expected one ended span, got %d", len(spans))
+	}
+	if status := spans[0].Status(); status.Code != codes.Error || status.Description != "handler_panic" {
+		t.Fatalf("unexpected panic span status: %+v", status)
+	}
+	events := spans[0].Events()
+	if len(events) != 1 || events[0].Name != "exception" {
+		t.Fatalf("expected one exception event, got %+v", events)
+	}
+	for _, attr := range events[0].Attributes {
+		if strings.Contains(attr.Value.AsString(), panicValue.Error()) {
+			t.Fatalf("private panic details in span event: %+v", attr)
+		}
+	}
+}
+
 func TestMetricsLagOwnershipAndReadinessConcurrent(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m, err := NewMetrics(reg)
@@ -398,13 +429,16 @@ func TestMetricsLagOwnershipAndReadinessConcurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 1. Stale owner cleanup must not delete a new owner's live lag series.
+	// 1. Stale owner cleanup must not delete a new owner's live backlog series.
 	m.recordLag(1, "grp-own", "orders", 0, 10)
 	m.recordLag(2, "grp-own", "orders", 0, 42)
 	m.cleanupLag(1, "grp-own", "orders", 0)
 
 	if got := testutil.ToFloat64(m.consumerLag.WithLabelValues("grp-own", "orders", "0")); got != 42 {
-		t.Fatalf("stale owner cleanup modified/deleted live owner lag: got %v, want 42", got)
+		t.Fatalf("stale owner cleanup modified/deleted live owner backlog: got %v, want 42", got)
+	}
+	if got := testutil.ToFloat64(m.backlogUpdatedAt.WithLabelValues("grp-own", "orders", "0")); got <= 0 {
+		t.Fatalf("expected positive backlog_updated_timestamp_seconds, got %v", got)
 	}
 
 	m.cleanupLag(2, "grp-own", "orders", 0)
@@ -413,8 +447,8 @@ func TestMetricsLagOwnershipAndReadinessConcurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, f := range fams {
-		if f.GetName() == "kafka_consumer_lag" && len(f.GetMetric()) != 0 {
-			t.Fatalf("expected lag series deleted after current owner cleanup, got %d", len(f.GetMetric()))
+		if (f.GetName() == "kafka_consumer_in_process_backlog" || f.GetName() == "kafka_consumer_backlog_updated_timestamp_seconds") && len(f.GetMetric()) != 0 {
+			t.Fatalf("expected %s series deleted after current owner cleanup, got %d", f.GetName(), len(f.GetMetric()))
 		}
 	}
 
@@ -457,7 +491,7 @@ func TestMetricsLagOwnershipAndReadinessConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := gc.Subscribe(Subscription{Topic: "t", Handler: func(context.Context, *Message) error { return nil }}); err != nil {
+	if err := gc.Subscribe(Subscription{Topic: "t", RetryPolicy: DefaultRetryPolicy(), Handler: func(context.Context, *Message) error { return nil }}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -487,5 +521,79 @@ func TestMetricsLagOwnershipAndReadinessConcurrent(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(m.consumerReady.WithLabelValues("grp-ready-race")); got != 0 {
 		t.Fatalf("expected kafka_consumer_ready=0 after Close, got %v", got)
+	}
+}
+
+func TestSafeErrorCodesAndBoundedPanicFrames(t *testing.T) {
+	if WithErrorCode(nil, "ignored") != nil {
+		t.Fatalf("WithErrorCode(nil, ...) must return nil")
+	}
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	dlq := &mockDLQProducer{}
+	rootErr := errors.New("secret_dsn=postgres://user:pass@host/db")
+	coded := WithErrorCode(rootErr, "db/conn timeout!")
+
+	rt := &retryRuntime{
+		groupID:  "grp-diag",
+		clientID: "cli-diag",
+		logger:   logger,
+		sleepFn:  func(ctx context.Context, d time.Duration) error { return ctx.Err() },
+		jitterFn: func(d time.Duration) time.Duration { return d },
+	}
+	policy, err := normalizeAndValidateRetryPolicy("orders", &RetryPolicy{
+		Strategy:         RetryStrategyDLQ,
+		MaxRetries:       1,
+		InitialDelay:     time.Millisecond,
+		MaxDelay:         time.Millisecond,
+		Multiplier:       1,
+		DLQTopic:         "orders-dlq",
+		DLQProducer:      dlq,
+		DLQFailurePolicy: DLQFailureStop,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var attempt int
+	res := rt.processMessage(context.Background(), &Message{
+		Topic:     "orders",
+		Partition: 0,
+		Offset:    5,
+	}, func(ctx context.Context, msg *Message) error {
+		attempt++
+		if attempt == 1 {
+			panic("PANIC_SECRET_XYZ")
+		}
+		return coded
+	}, policy, time.Second)
+
+	if res.Outcome != outcomeDeadLettered || !errors.Is(res.Err, rootErr) {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+
+	out := logBuf.String()
+	if strings.Contains(out, "PANIC_SECRET_XYZ") || strings.Contains(out, "postgres://") {
+		t.Fatalf("sensitive details leaked into logs:\n%s", out)
+	}
+	if !strings.Contains(out, `"panic_frames"`) {
+		t.Fatalf("expected bounded panic_frames in panic log, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"failure_category":"db_conn_timeout"`) {
+		t.Fatalf("expected sanitized safe error code db_conn_timeout in logs, got:\n%s", out)
+	}
+
+	var origErr string
+	for _, h := range dlq.calls[0].Headers {
+		if h.Key == HeaderOriginalError {
+			origErr = string(h.Value)
+		}
+	}
+	if origErr != "db_conn_timeout" {
+		t.Fatalf("expected DLQ x-original-error=db_conn_timeout, got %q", origErr)
+	}
+	if got := safeConsumerDiagnostic(coded); got != "transient: db_conn_timeout" {
+		t.Fatalf("unexpected safeConsumerDiagnostic: %q", got)
 	}
 }

@@ -14,19 +14,23 @@ const (
 	defaultMaxMessageBytes     = 1000000
 	defaultProducerTimeout     = 10 * time.Second
 	defaultProducerCompression = "snappy"
+	defaultProducerPartitioner = "hash"
 	defaultProducerRetries     = 3
 	defaultProducerBackoff     = 100 * time.Millisecond
 
-	defaultInitialOffset     = "newest"
-	defaultBalanceStrategy   = "roundrobin"
-	defaultSessionTimeout    = 10 * time.Second
-	defaultHeartbeatInterval = 3 * time.Second
-	defaultRebalanceTimeout  = 60 * time.Second
-	defaultMaxProcessingTime = 30 * time.Second
-	defaultCommitMode        = CommitPeriodic
-	defaultCommitInterval    = 5 * time.Second
-	defaultHandlerTimeout    = 30 * time.Second
-	defaultShutdownTimeout   = 30 * time.Second
+	defaultInitialOffset       = "oldest"
+	defaultBalanceStrategy     = "roundrobin"
+	defaultIsolationLevel      = IsolationReadUncommitted
+	defaultSessionTimeout      = 10 * time.Second
+	defaultHeartbeatInterval   = 3 * time.Second
+	defaultRebalanceTimeout    = 60 * time.Second
+	defaultMaxProcessingTime   = 100 * time.Millisecond
+	defaultCommitMode          = CommitPeriodic
+	defaultCommitInterval      = 5 * time.Second
+	defaultHandlerTimeout      = 30 * time.Second
+	defaultShutdownTimeout     = 30 * time.Second
+	defaultCloseTimeout        = 5 * time.Second
+	defaultResetInvalidOffsets = true
 )
 
 // CommitMode defines how consumer offsets are committed to Kafka.
@@ -39,6 +43,17 @@ const (
 	// CommitSync commits marked offsets synchronously after each resolved message
 	// and performs a best-effort commit on session cleanup.
 	CommitSync CommitMode = "sync"
+)
+
+// IsolationLevel defines how a consumer reads records written by transactional producers.
+type IsolationLevel string
+
+const (
+	// IsolationReadUncommitted returns all messages, including uncommitted and aborted transactional records.
+	IsolationReadUncommitted IsolationLevel = "read_uncommitted"
+
+	// IsolationReadCommitted hides records belonging to aborted transactions.
+	IsolationReadCommitted IsolationLevel = "read_committed"
 )
 
 // BrokerConfig contains reusable Kafka cluster connectivity, authentication, and network settings.
@@ -84,6 +99,9 @@ type SASLConfig struct {
 
 	// Password for SASL authentication
 	Password string `json:"password" yaml:"password" env:"PASSWORD"`
+
+	// AllowInsecurePlaintext explicitly opts in to SASL PLAIN over non-TLS connections (development only).
+	AllowInsecurePlaintext bool `json:"allow_insecure_plaintext" yaml:"allow_insecure_plaintext" env:"ALLOW_INSECURE_PLAINTEXT" envDefault:"false"`
 }
 
 // TLSConfig contains TLS settings.
@@ -111,10 +129,17 @@ type ConsumerConfig struct {
 
 	// InitialOffset determines where to start consuming when no valid committed offset exists.
 	// Valid values: "oldest", "newest"
-	InitialOffset string `json:"initial_offset" yaml:"initial_offset" env:"INITIAL_OFFSET" envDefault:"newest"`
+	InitialOffset string `json:"initial_offset" yaml:"initial_offset" env:"INITIAL_OFFSET" envDefault:"oldest"`
+
+	// ResetInvalidOffsets automatically resets out-of-range offsets to InitialOffset when true.
+	// When false, out-of-range offsets stop the consumer with a terminal error instead of resetting.
+	ResetInvalidOffsets bool `json:"reset_invalid_offsets" yaml:"reset_invalid_offsets" env:"RESET_INVALID_OFFSETS" envDefault:"true"`
 
 	// BalanceStrategy selects the partition assignment strategy ("roundrobin", "sticky", "range").
 	BalanceStrategy string `json:"balance_strategy" yaml:"balance_strategy" env:"BALANCE_STRATEGY" envDefault:"roundrobin"`
+
+	// IsolationLevel controls transactional read isolation ("read_uncommitted" or "read_committed").
+	IsolationLevel IsolationLevel `json:"isolation_level" yaml:"isolation_level" env:"ISOLATION_LEVEL" envDefault:"read_uncommitted"`
 
 	// SessionTimeout is the timeout for consumer group sessions
 	SessionTimeout time.Duration `json:"session_timeout" yaml:"session_timeout" env:"SESSION_TIMEOUT" envDefault:"10s"`
@@ -126,7 +151,7 @@ type ConsumerConfig struct {
 	RebalanceTimeout time.Duration `json:"rebalance_timeout" yaml:"rebalance_timeout" env:"REBALANCE_TIMEOUT" envDefault:"60s"`
 
 	// MaxProcessingTime is Sarama's message-channel delivery backpressure timeout, NOT a per-message handler deadline.
-	MaxProcessingTime time.Duration `json:"max_processing_time" yaml:"max_processing_time" env:"MAX_PROCESSING_TIME" envDefault:"30s"`
+	MaxProcessingTime time.Duration `json:"max_processing_time" yaml:"max_processing_time" env:"MAX_PROCESSING_TIME" envDefault:"100ms"`
 
 	// CommitMode selects offset commit behavior ("periodic" or "sync").
 	CommitMode CommitMode `json:"commit_mode" yaml:"commit_mode" env:"COMMIT_MODE" envDefault:"periodic"`
@@ -137,8 +162,12 @@ type ConsumerConfig struct {
 	// HandlerTimeout is the default cooperative per-attempt timeout applied to message handlers.
 	HandlerTimeout time.Duration `json:"handler_timeout" yaml:"handler_timeout" env:"HANDLER_TIMEOUT" envDefault:"30s"`
 
-	// ShutdownTimeout is the graceful drain budget allowed for admitted in-flight messages on shutdown.
+	// ShutdownTimeout is the graceful handler drain budget allowed for admitted in-flight messages on shutdown.
 	ShutdownTimeout time.Duration `json:"shutdown_timeout" yaml:"shutdown_timeout" env:"SHUTDOWN_TIMEOUT" envDefault:"30s"`
+
+	// CloseTimeout limits how long to wait before aborting pending consumer broker I/O
+	// once the drain completes or expires.
+	CloseTimeout time.Duration `json:"close_timeout" yaml:"close_timeout" env:"CLOSE_TIMEOUT" envDefault:"5s"`
 }
 
 // ProducerConfig contains producer-specific settings.
@@ -156,7 +185,13 @@ type ProducerConfig struct {
 	// Compression is the compression codec (none, gzip, snappy, lz4, zstd)
 	Compression string `json:"compression" yaml:"compression" env:"COMPRESSION" envDefault:"snappy"`
 
-	// Idempotent enables idempotent producer
+	// Partitioner selects key-to-partition routing: "hash" (default Sarama FNV-1a),
+	// "crc32" (librdkafka consistent_random compatible), "murmur2" (Kafka Java client compatible),
+	// "roundrobin", or "random".
+	Partitioner string `json:"partitioner" yaml:"partitioner" env:"PARTITIONER" envDefault:"hash"`
+
+	// Idempotent enables idempotent producer (forces Net.MaxOpenRequests=1 for in-flight ordering).
+	// When false, retries with multiple open requests can reorder messages within a partition.
 	Idempotent bool `json:"idempotent" yaml:"idempotent" env:"IDEMPOTENT" envDefault:"true"`
 
 	// MaxRetries is the maximum number of retries for failed produce requests
@@ -189,6 +224,7 @@ func DefaultProducerConfig() ProducerConfig {
 		RequiredAcks:    -1,
 		Timeout:         defaultProducerTimeout,
 		Compression:     defaultProducerCompression,
+		Partitioner:     defaultProducerPartitioner,
 		Idempotent:      true,
 		MaxRetries:      defaultProducerRetries,
 		RetryBackoff:    defaultProducerBackoff,
@@ -199,16 +235,19 @@ func DefaultProducerConfig() ProducerConfig {
 // GroupID is left empty and must be populated by the caller.
 func DefaultConsumerConfig() ConsumerConfig {
 	return ConsumerConfig{
-		InitialOffset:     defaultInitialOffset,
-		BalanceStrategy:   defaultBalanceStrategy,
-		SessionTimeout:    defaultSessionTimeout,
-		HeartbeatInterval: defaultHeartbeatInterval,
-		RebalanceTimeout:  defaultRebalanceTimeout,
-		MaxProcessingTime: defaultMaxProcessingTime,
-		CommitMode:        defaultCommitMode,
-		CommitInterval:    defaultCommitInterval,
-		HandlerTimeout:    defaultHandlerTimeout,
-		ShutdownTimeout:   defaultShutdownTimeout,
+		InitialOffset:       defaultInitialOffset,
+		ResetInvalidOffsets: defaultResetInvalidOffsets,
+		BalanceStrategy:     defaultBalanceStrategy,
+		IsolationLevel:      defaultIsolationLevel,
+		SessionTimeout:      defaultSessionTimeout,
+		HeartbeatInterval:   defaultHeartbeatInterval,
+		RebalanceTimeout:    defaultRebalanceTimeout,
+		MaxProcessingTime:   defaultMaxProcessingTime,
+		CommitMode:          defaultCommitMode,
+		CommitInterval:      defaultCommitInterval,
+		HandlerTimeout:      defaultHandlerTimeout,
+		ShutdownTimeout:     defaultShutdownTimeout,
+		CloseTimeout:        defaultCloseTimeout,
 	}
 }
 
@@ -265,6 +304,15 @@ func normalizeAndValidateBrokerConfig(cfg BrokerConfig) (BrokerConfig, error) {
 		default:
 			return BrokerConfig{}, fmt.Errorf("unsupported SASL mechanism: %s", cfg.Auth.SASL.Mechanism)
 		}
+		if cfg.Auth.SASL.Mechanism == "PLAIN" && !cfg.Auth.TLS.Enabled && !cfg.Auth.SASL.AllowInsecurePlaintext {
+			return BrokerConfig{}, fmt.Errorf("SASL PLAIN requires TLS to be enabled unless allow_insecure_plaintext is explicitly set")
+		}
+	} else {
+		if strings.TrimSpace(cfg.Auth.SASL.Username) != "" || cfg.Auth.SASL.Password != "" ||
+			cfg.Auth.SASL.AllowInsecurePlaintext ||
+			(cfg.Auth.SASL.Mechanism != "" && cfg.Auth.SASL.Mechanism != "PLAIN") {
+			return BrokerConfig{}, fmt.Errorf("SASL credentials or options cannot be configured when SASL is disabled")
+		}
 	}
 
 	if cfg.Auth.TLS.Enabled {
@@ -273,9 +321,41 @@ func normalizeAndValidateBrokerConfig(cfg BrokerConfig) (BrokerConfig, error) {
 		if hasCert != hasKey {
 			return BrokerConfig{}, fmt.Errorf("both TLS cert_file and key_file must be specified together")
 		}
+	} else {
+		if strings.TrimSpace(cfg.Auth.TLS.CertFile) != "" ||
+			strings.TrimSpace(cfg.Auth.TLS.KeyFile) != "" ||
+			strings.TrimSpace(cfg.Auth.TLS.CAFile) != "" ||
+			cfg.Auth.TLS.InsecureSkipVerify {
+			return BrokerConfig{}, fmt.Errorf("TLS certificates or security options cannot be configured when TLS is disabled")
+		}
 	}
 
 	return cfg, nil
+}
+
+const maxTopicNameLen = 249
+
+func validateTopicName(topic string) error {
+	if topic == "" {
+		return fmt.Errorf("topic name is required")
+	}
+	if len(topic) > maxTopicNameLen {
+		return fmt.Errorf("topic name %q exceeds maximum length of %d characters", topic, maxTopicNameLen)
+	}
+	if topic == "." || topic == ".." {
+		return fmt.Errorf("topic name %q is reserved and invalid", topic)
+	}
+	for i := 0; i < len(topic); i++ {
+		c := topic[i]
+		valid := (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') ||
+			c == '.' || c == '_' || c == '-'
+		if !valid {
+			return fmt.Errorf("topic name %q contains invalid character %q (permitted: ASCII letters, digits, '.', '_', '-')", topic, c)
+		}
+	}
+	return nil
 }
 
 func validateBrokerAddr(addr string) error {
@@ -303,6 +383,9 @@ func normalizeAndValidateProducerConfig(cfg ProducerConfig) (ProducerConfig, err
 	if cfg.Compression == "" {
 		cfg.Compression = defaultProducerCompression
 	}
+	if cfg.Partitioner == "" {
+		cfg.Partitioner = defaultProducerPartitioner
+	}
 
 	if cfg.MaxMessageBytes <= 0 {
 		return ProducerConfig{}, fmt.Errorf("producer max_message_bytes must be greater than zero")
@@ -319,6 +402,11 @@ func normalizeAndValidateProducerConfig(cfg ProducerConfig) (ProducerConfig, err
 	case "none", "gzip", "snappy", "lz4", "zstd":
 	default:
 		return ProducerConfig{}, fmt.Errorf("unsupported producer compression %q", cfg.Compression)
+	}
+	switch cfg.Partitioner {
+	case "hash", "crc32", "murmur2", "roundrobin", "random":
+	default:
+		return ProducerConfig{}, fmt.Errorf("unsupported producer partitioner %q: must be \"hash\", \"crc32\", \"murmur2\", \"roundrobin\", or \"random\"", cfg.Partitioner)
 	}
 	if cfg.MaxRetries < 0 {
 		return ProducerConfig{}, fmt.Errorf("producer max_retries cannot be negative")
@@ -350,6 +438,14 @@ func normalizeAndValidateConsumerConfig(cfg ConsumerConfig) (ConsumerConfig, err
 	case "roundrobin", "sticky", "range":
 	default:
 		return ConsumerConfig{}, fmt.Errorf("unsupported balance_strategy %q: must be \"roundrobin\", \"sticky\", or \"range\"", cfg.BalanceStrategy)
+	}
+	if cfg.IsolationLevel == "" {
+		cfg.IsolationLevel = defaultIsolationLevel
+	}
+	switch cfg.IsolationLevel {
+	case IsolationReadUncommitted, IsolationReadCommitted:
+	default:
+		return ConsumerConfig{}, fmt.Errorf("unsupported isolation_level %q: must be \"read_uncommitted\" or \"read_committed\"", cfg.IsolationLevel)
 	}
 	if cfg.SessionTimeout <= 0 {
 		return ConsumerConfig{}, fmt.Errorf("consumer session_timeout must be greater than zero")
@@ -383,6 +479,12 @@ func normalizeAndValidateConsumerConfig(cfg ConsumerConfig) (ConsumerConfig, err
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		return ConsumerConfig{}, fmt.Errorf("consumer shutdown_timeout must be greater than zero")
+	}
+	if cfg.CloseTimeout == 0 {
+		cfg.CloseTimeout = defaultCloseTimeout
+	}
+	if cfg.CloseTimeout < 0 {
+		return ConsumerConfig{}, fmt.Errorf("consumer close_timeout must be greater than zero")
 	}
 	return cfg, nil
 }

@@ -242,7 +242,8 @@ func TestIT01_BasicProduceConsumeJSONHeadersAndTracing(t *testing.T) {
 
 	var gotA, gotB atomic.Bool
 	if err := gc.Subscribe(kafka.Subscription{
-		Topic: topicA,
+		Topic:       topicA,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
 		Handler: func(ctx context.Context, msg *kafka.Message) error {
 			v, ok := msg.GetHeader("x-hdr")
 			if string(msg.Key) == "k1" && string(msg.Value) == "v1" && ok && string(v) == "abc" {
@@ -254,7 +255,8 @@ func TestIT01_BasicProduceConsumeJSONHeadersAndTracing(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := gc.Subscribe(kafka.Subscription{
-		Topic: topicB,
+		Topic:       topicB,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
 		Handler: func(ctx context.Context, msg *kafka.Message) error {
 			if string(msg.Key) == "k2" && strings.Contains(string(msg.Value), `"hello":"world"`) {
 				gotB.Store(true)
@@ -449,7 +451,8 @@ func TestIT04_BoundedRetriesAndRealDLQ(t *testing.T) {
 	var dlqMu sync.Mutex
 	dlqCtx, dlqCancel := context.WithCancel(context.Background())
 	if err := dlqVerify.Subscribe(kafka.Subscription{
-		Topic: dlqTopic,
+		Topic:       dlqTopic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
 		Handler: func(ctx context.Context, msg *kafka.Message) error {
 			dlqMu.Lock()
 			dlqMsg = msg
@@ -793,7 +796,8 @@ func TestIT07_RebalanceDuringRetryPreservesUnresolvedOffset(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := gc2.Subscribe(kafka.Subscription{
-		Topic: topic,
+		Topic:       topic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
 		Handler: func(ctx context.Context, msg *kafka.Message) error {
 			mu.Lock()
 			completed[string(msg.Value)]++
@@ -868,7 +872,8 @@ func TestIT08_GracefulShutdownAndRestartPeriodicAndSync(t *testing.T) {
 			var mu sync.Mutex
 
 			if err := gc1.Subscribe(kafka.Subscription{
-				Topic: topic,
+				Topic:       topic,
+				RetryPolicy: kafka.DefaultRetryPolicy(),
 				Handler: func(ctx context.Context, msg *kafka.Message) error {
 					if string(msg.Value) == "m0" {
 						close(m0Started)
@@ -907,7 +912,8 @@ func TestIT08_GracefulShutdownAndRestartPeriodicAndSync(t *testing.T) {
 			var resumed []string
 			ctx2, cancel2 := context.WithCancel(context.Background())
 			if err := gc2.Subscribe(kafka.Subscription{
-				Topic: topic,
+				Topic:       topic,
+				RetryPolicy: kafka.DefaultRetryPolicy(),
 				Handler: func(ctx context.Context, msg *kafka.Message) error {
 					mu.Lock()
 					resumed = append(resumed, string(msg.Value))
@@ -960,7 +966,8 @@ func TestIT09_HybridMultipleGroupsIndependentDelivery(t *testing.T) {
 
 	var gotAShared, gotBShared, gotBOnly atomic.Bool
 	if err := gA.Subscribe(kafka.Subscription{
-		Topic: sharedTopic,
+		Topic:       sharedTopic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
 		Handler: func(ctx context.Context, msg *kafka.Message) error {
 			gotAShared.Store(true)
 			return nil
@@ -969,7 +976,8 @@ func TestIT09_HybridMultipleGroupsIndependentDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := gB.Subscribe(kafka.Subscription{
-		Topic: sharedTopic,
+		Topic:       sharedTopic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
 		Handler: func(ctx context.Context, msg *kafka.Message) error {
 			gotBShared.Store(true)
 			return nil
@@ -978,7 +986,8 @@ func TestIT09_HybridMultipleGroupsIndependentDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := gB.Subscribe(kafka.Subscription{
-		Topic: onlyBTopic,
+		Topic:       onlyBTopic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
 		Handler: func(ctx context.Context, msg *kafka.Message) error {
 			gotBOnly.Store(true)
 			return nil
@@ -1050,7 +1059,8 @@ func TestIT10_MultipleReplicasAndAssignors(t *testing.T) {
 					t.Fatal(err)
 				}
 				if err := gc.Subscribe(kafka.Subscription{
-					Topic: topic,
+					Topic:       topic,
+					RetryPolicy: kafka.DefaultRetryPolicy(),
 					Handler: func(ctx context.Context, msg *kafka.Message) error {
 						mu.Lock()
 						defer mu.Unlock()
@@ -1125,7 +1135,8 @@ func TestIT11_BrokerOutageAndRestoration(t *testing.T) {
 
 	var gotBefore, gotAfter atomic.Bool
 	if err := gc.Subscribe(kafka.Subscription{
-		Topic: topic,
+		Topic:       topic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
 		Handler: func(ctx context.Context, msg *kafka.Message) error {
 			switch string(msg.Value) {
 			case "before":
@@ -1154,8 +1165,9 @@ func TestIT11_BrokerOutageAndRestoration(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := gcOutage.Subscribe(kafka.Subscription{
-		Topic:   topic,
-		Handler: func(context.Context, *kafka.Message) error { return nil },
+		Topic:       topic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
+		Handler:     func(context.Context, *kafka.Message) error { return nil },
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1264,7 +1276,8 @@ func TestIT12_GroupOffsetContinuityAndInitialOffsetReplay(t *testing.T) {
 	var gotFirst atomic.Bool
 	done1 := make(chan error, 1)
 	if err := c1.Subscribe(kafka.Subscription{
-		Topic: topic,
+		Topic:       topic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
 		Handler: func(ctx context.Context, msg *kafka.Message) error {
 			if string(msg.Value) == "first" {
 				gotFirst.Store(true)
@@ -1302,7 +1315,8 @@ func TestIT12_GroupOffsetContinuityAndInitialOffsetReplay(t *testing.T) {
 	var mu sync.Mutex
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	if err := c2.Subscribe(kafka.Subscription{
-		Topic: topic,
+		Topic:       topic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
 		Handler: func(ctx context.Context, msg *kafka.Message) error {
 			mu.Lock()
 			values = append(values, string(msg.Value))
@@ -1338,7 +1352,8 @@ func TestIT12_GroupOffsetContinuityAndInitialOffsetReplay(t *testing.T) {
 	var newestReady atomic.Bool
 	nCtx, nCancel := context.WithCancel(context.Background())
 	if err := cNewest.Subscribe(kafka.Subscription{
-		Topic: replayTopic,
+		Topic:       replayTopic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
 		Handler: func(ctx context.Context, msg *kafka.Message) error {
 			mu.Lock()
 			newestSeen = append(newestSeen, string(msg.Value))
@@ -1380,7 +1395,8 @@ func TestIT12_GroupOffsetContinuityAndInitialOffsetReplay(t *testing.T) {
 	var oldestSeen []string
 	oCtx, oCancel := context.WithCancel(context.Background())
 	if err := cOldest.Subscribe(kafka.Subscription{
-		Topic: replayTopic,
+		Topic:       replayTopic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
 		Handler: func(ctx context.Context, msg *kafka.Message) error {
 			mu.Lock()
 			oldestSeen = append(oldestSeen, string(msg.Value))
@@ -1399,5 +1415,766 @@ func TestIT12_GroupOffsetContinuityAndInitialOffsetReplay(t *testing.T) {
 	}
 	if !slices.Equal(oldestSeen, []string{"unresolved-uncommitted", "after-newest-join"}) {
 		t.Fatalf("expected InitialOffset=oldest to replay historical records, got %v", oldestSeen)
+	}
+}
+
+func TestIT13_PartitionSaturationDoesNotStallOtherTopics(t *testing.T) {
+	brokers := integrationBrokers(t)
+	satTopic := uniqueName("it13-sat")
+	fastTopic := uniqueName("it13-fast")
+	createTestTopic(t, brokers, satTopic, 1)
+	createTestTopic(t, brokers, fastTopic, 1)
+
+	reg := prometheus.NewRegistry()
+	metrics, err := kafka.NewMetrics(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prodCfg := kafka.DefaultProducerConfig()
+	prodCfg.Compression = "none"
+	prod, err := kafka.NewProducer(brokerCfgFor(brokers), prodCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+
+	// Use DefaultConsumerConfig (MaxProcessingTime=100ms per F02).
+	cCfg := kafka.DefaultConsumerConfig()
+	cCfg.GroupID = uniqueName("grp-it13")
+	cCfg.InitialOffset = "oldest"
+	cCfg.ShutdownTimeout = 2 * time.Second
+	cCfg.CloseTimeout = 2 * time.Second
+	if cCfg.MaxProcessingTime != 100*time.Millisecond {
+		t.Fatalf("expected default MaxProcessingTime=100ms, got %s", cCfg.MaxProcessingTime)
+	}
+
+	gc, err := kafka.NewConsumer(brokerCfgFor(brokers), cCfg, testLogger(), kafka.WithConsumerMetrics(metrics))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	satBlocked := make(chan struct{})
+	var satOnce sync.Once
+	releaseSat := make(chan struct{})
+	var fastCount atomic.Int32
+
+	if err := gc.Subscribe(kafka.Subscription{
+		Topic:       satTopic,
+		RetryPolicy: &kafka.RetryPolicy{Strategy: kafka.RetryStrategyInfinite, InitialDelay: 50 * time.Millisecond, MaxDelay: 100 * time.Millisecond, Multiplier: 1.5},
+		Handler: func(ctx context.Context, msg *kafka.Message) error {
+			satOnce.Do(func() { close(satBlocked) })
+			select {
+			case <-releaseSat:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := gc.Subscribe(kafka.Subscription{
+		Topic:       fastTopic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
+		Handler: func(ctx context.Context, msg *kafka.Message) error {
+			fastCount.Add(1)
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- gc.Run(ctx) }()
+
+	waitForCondition(t, 15*time.Second, "IT13 consumer ready", func() bool {
+		return gc.Health().Ready
+	})
+
+	// Publish > ChannelBufferSize (256) records to satTopic to saturate its internal buffer while handler is blocked.
+	const satRecords = 350
+	var pubWg sync.WaitGroup
+	for w := 0; w < 5; w++ {
+		pubWg.Add(1)
+		go func(worker int) {
+			defer pubWg.Done()
+			for i := 0; i < satRecords/5; i++ {
+				_ = prod.Publish(context.Background(), satTopic, []byte("sat"), []byte(fmt.Sprintf("sat-%d-%d", worker, i)))
+			}
+		}(w)
+	}
+	pubWg.Wait()
+
+	select {
+	case <-satBlocked:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("satTopic handler did not start blocking")
+	}
+
+	// Allow Sarama's responseFeeder to fill the 256-entry buffer and hit MaxProcessingTime (100ms).
+	time.Sleep(400 * time.Millisecond)
+
+	// Now publish 20 messages to fastTopic; they must make prompt progress despite satTopic saturation.
+	const fastRecords = 20
+	for i := 0; i < fastRecords; i++ {
+		if err := prod.Publish(context.Background(), fastTopic, []byte(fmt.Sprintf("fk-%d", i)), []byte("fast-ok")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fastStart := time.Now()
+	waitForCondition(t, 5*time.Second, "fastTopic completes while satTopic buffer is saturated", func() bool {
+		return fastCount.Load() == fastRecords
+	})
+	t.Logf("fastTopic processed %d records in %s while %s was saturated", fastRecords, time.Since(fastStart), satTopic)
+
+	// Verify observed in-process backlog and updated timestamp metrics were populated for satTopic.
+	fams, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawBacklog, sawUpdated bool
+	for _, f := range fams {
+		switch f.GetName() {
+		case "kafka_consumer_in_process_backlog":
+			if len(f.GetMetric()) > 0 {
+				sawBacklog = true
+			}
+		case "kafka_consumer_backlog_updated_timestamp_seconds":
+			if len(f.GetMetric()) > 0 {
+				sawUpdated = true
+			}
+		}
+	}
+	if !sawBacklog || !sawUpdated {
+		t.Fatalf("expected backlog and updated timestamp metrics, got sawBacklog=%v sawUpdated=%v", sawBacklog, sawUpdated)
+	}
+
+	close(releaseSat)
+	cancel()
+	if err := <-runDone; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestIT14_ReadinessClaimInitAndNewestStartupRace(t *testing.T) {
+	brokers := integrationBrokers(t)
+	topic := uniqueName("it14-ready")
+	createTestTopic(t, brokers, topic, 4)
+
+	prod, err := kafka.NewProducer(brokerCfgFor(brokers), kafka.DefaultProducerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+
+	// Publish pre-existing record that "newest" must skip once ready.
+	if err := prod.Publish(context.Background(), topic, []byte("pre"), []byte("pre-ready")); err != nil {
+		t.Fatal(err)
+	}
+
+	cCfg := consumerCfgFor(uniqueName("grp-it14"))
+	cCfg.InitialOffset = "newest"
+	gc, err := kafka.NewConsumer(brokerCfgFor(brokers), cCfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	if err := gc.Subscribe(kafka.Subscription{
+		Topic:       topic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
+		Handler: func(ctx context.Context, msg *kafka.Message) error {
+			mu.Lock()
+			seen[string(msg.Value)] = true
+			mu.Unlock()
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- gc.Run(ctx) }()
+
+	waitForCondition(t, 20*time.Second, "consumer Ready after all 4 claims initialized", func() bool {
+		h := gc.Health()
+		return h.Ready && h.AssignedClaims == 4
+	})
+
+	// Immediately publish across all partitions after Ready=true; none must be missed.
+	const afterCount = 20
+	for i := 0; i < afterCount; i++ {
+		if err := prod.Publish(context.Background(), topic, []byte(fmt.Sprintf("k-%d", i)), []byte(fmt.Sprintf("after-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	waitForCondition(t, 15*time.Second, "all post-ready messages received without startup race", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for i := 0; i < afterCount; i++ {
+			if !seen[fmt.Sprintf("after-%d", i)] {
+				return false
+			}
+		}
+		return true
+	})
+	mu.Lock()
+	sawPre := seen["pre-ready"]
+	mu.Unlock()
+	if sawPre {
+		t.Fatalf("InitialOffset=newest should have skipped pre-ready message")
+	}
+
+	cancel()
+	if err := <-runDone; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestIT15_InvalidOffsetRecoveryAndFailClosed(t *testing.T) {
+	brokers := integrationBrokers(t)
+	topic := uniqueName("it15-invalid-off")
+	createTestTopic(t, brokers, topic, 1)
+
+	prod, err := kafka.NewProducer(brokerCfgFor(brokers), kafka.DefaultProducerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+
+	for i := 0; i < 5; i++ {
+		if err := prod.Publish(context.Background(), topic, []byte("k"), []byte(fmt.Sprintf("m-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	groupID := uniqueName("grp-it15")
+	cc1 := consumerCfgFor(groupID)
+	cc1.CommitMode = kafka.CommitSync
+	c1, err := kafka.NewConsumer(brokerCfgFor(brokers), cc1, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	var m0Done atomic.Bool
+	if err := c1.Subscribe(kafka.Subscription{
+		Topic:       topic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
+		Handler: func(ctx context.Context, msg *kafka.Message) error {
+			if string(msg.Value) == "m-0" {
+				m0Done.Store(true)
+			}
+			cancel1()
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.Run(ctx1); err != nil {
+		t.Fatalf("c1 Run: %v", err)
+	}
+	if !m0Done.Load() {
+		t.Fatalf("expected m-0 committed")
+	}
+
+	// Truncate log so committed offset (1) falls before LogStartOffset (3).
+	admin, err := sarama.NewClusterAdmin(brokers, sarama.NewConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.DeleteRecords(topic, map[int32]int64{0: 3}); err != nil {
+		_ = admin.Close()
+		t.Fatalf("DeleteRecords: %v", err)
+	}
+	_ = admin.Close()
+
+	// 1. With ResetInvalidOffsets=false, consumer must fail observably with ErrOffsetOutOfRange.
+	ccFail := consumerCfgFor(groupID)
+	ccFail.ResetInvalidOffsets = false
+	cFail, err := kafka.NewConsumer(brokerCfgFor(brokers), ccFail, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cFail.Subscribe(kafka.Subscription{
+		Topic:       topic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
+		Handler:     func(context.Context, *kafka.Message) error { return nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	failCtx, failCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer failCancel()
+	runErr := cFail.Run(failCtx)
+	if !errors.Is(runErr, sarama.ErrOffsetOutOfRange) {
+		t.Fatalf("expected ErrOffsetOutOfRange with ResetInvalidOffsets=false, got %v", runErr)
+	}
+	if h := cFail.Health(); h.State != kafka.ConsumerStateFailed || h.Ready {
+		t.Fatalf("expected Failed/unready health, got %+v", h)
+	}
+
+	// 2. With ResetInvalidOffsets=true and InitialOffset=oldest, consumer resets to LogStartOffset=3 and reads m-3, m-4.
+	ccReset := consumerCfgFor(groupID)
+	ccReset.ResetInvalidOffsets = true
+	ccReset.InitialOffset = "oldest"
+	cReset, err := kafka.NewConsumer(brokerCfgFor(brokers), ccReset, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recovered []string
+	var mu sync.Mutex
+	resCtx, resCancel := context.WithCancel(context.Background())
+	if err := cReset.Subscribe(kafka.Subscription{
+		Topic:       topic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
+		Handler: func(ctx context.Context, msg *kafka.Message) error {
+			mu.Lock()
+			recovered = append(recovered, string(msg.Value))
+			n := len(recovered)
+			mu.Unlock()
+			if n == 2 {
+				resCancel()
+			}
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cReset.Run(resCtx); err != nil {
+		t.Fatalf("cReset Run: %v", err)
+	}
+	if !slices.Equal(recovered, []string{"m-3", "m-4"}) {
+		t.Fatalf("expected [m-3 m-4] after oldest reset, got %v", recovered)
+	}
+
+	// 3. Interrupted first message on fresh group with default InitialOffset (oldest) replays without skipping.
+	freshTopic := uniqueName("it15-fresh")
+	createTestTopic(t, brokers, freshTopic, 1)
+	if err := prod.Publish(context.Background(), freshTopic, []byte("k0"), []byte("first-event")); err != nil {
+		t.Fatal(err)
+	}
+	freshGroup := uniqueName("grp-it15-fresh")
+	freshCfg := kafka.DefaultConsumerConfig()
+	freshCfg.GroupID = freshGroup
+	freshCfg.CommitInterval = 200 * time.Millisecond
+	freshCfg.ShutdownTimeout = 200 * time.Millisecond
+
+	cInt, err := kafka.NewConsumer(brokerCfgFor(brokers), freshCfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	intStarted := make(chan struct{})
+	intCtx, intCancel := context.WithCancel(context.Background())
+	if err := cInt.Subscribe(kafka.Subscription{
+		Topic:       freshTopic,
+		RetryPolicy: &kafka.RetryPolicy{Strategy: kafka.RetryStrategyInfinite, InitialDelay: 50 * time.Millisecond, MaxDelay: 100 * time.Millisecond, Multiplier: 1.5},
+		Handler: func(ctx context.Context, msg *kafka.Message) error {
+			select {
+			case <-intStarted:
+			default:
+				close(intStarted)
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	intDone := make(chan error, 1)
+	go func() { intDone <- cInt.Run(intCtx) }()
+	<-intStarted
+	intCancel()
+	if err := <-intDone; err != nil {
+		t.Fatalf("cInt Run: %v", err)
+	}
+
+	cReplay, err := kafka.NewConsumer(brokerCfgFor(brokers), freshCfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replayed string
+	repCtx, repCancel := context.WithCancel(context.Background())
+	if err := cReplay.Subscribe(kafka.Subscription{
+		Topic:       freshTopic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
+		Handler: func(ctx context.Context, msg *kafka.Message) error {
+			replayed = string(msg.Value)
+			repCancel()
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cReplay.Run(repCtx); err != nil {
+		t.Fatalf("cReplay Run: %v", err)
+	}
+	if replayed != "first-event" {
+		t.Fatalf("expected interrupted first-event to replay under default oldest, got %q", replayed)
+	}
+}
+
+func TestIT16_RetryStopAndPermanentErrorIntegration(t *testing.T) {
+	brokers := integrationBrokers(t)
+	topic := uniqueName("it16-stop")
+	createTestTopic(t, brokers, topic, 1)
+
+	prod, err := kafka.NewProducer(brokerCfgFor(brokers), kafka.DefaultProducerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+
+	if err := prod.Publish(context.Background(), topic, []byte("k"), []byte("m-0")); err != nil {
+		t.Fatal(err)
+	}
+	if err := prod.Publish(context.Background(), topic, []byte("k"), []byte("m-1")); err != nil {
+		t.Fatal(err)
+	}
+
+	groupID := uniqueName("grp-it16-stop")
+	cc := consumerCfgFor(groupID)
+	cc.CommitMode = kafka.CommitSync
+
+	gc, err := kafka.NewConsumer(brokerCfgFor(brokers), cc, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attempts atomic.Int32
+	var sawM1 atomic.Bool
+	sentinel := errors.New("db outage")
+	if err := gc.Subscribe(kafka.Subscription{
+		Topic: topic,
+		RetryPolicy: &kafka.RetryPolicy{
+			Strategy:     kafka.RetryStrategyStop,
+			MaxRetries:   2,
+			InitialDelay: 20 * time.Millisecond,
+			MaxDelay:     50 * time.Millisecond,
+			Multiplier:   1.5,
+		},
+		Handler: func(ctx context.Context, msg *kafka.Message) error {
+			if string(msg.Value) == "m-1" {
+				sawM1.Store(true)
+			}
+			attempts.Add(1)
+			return sentinel
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runErr := gc.Run(context.Background())
+	if !errors.Is(runErr, sentinel) {
+		t.Fatalf("expected wrapped sentinel from RetryStrategyStop, got %v", runErr)
+	}
+	if attempts.Load() != 3 || sawM1.Load() {
+		t.Fatalf("expected 3 attempts on m-0 and m-1 untouched, got attempts=%d sawM1=%v", attempts.Load(), sawM1.Load())
+	}
+	if off, ok := committedOffset(t, brokers, groupID, topic, 0); ok && off > 0 {
+		t.Fatalf("expected no committed offset on stopped failure, got %d", off)
+	}
+
+	// Permanent error under Infinite also stops immediately without marking.
+	gcPerm, err := kafka.NewConsumer(brokerCfgFor(brokers), cc, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var permAttempts atomic.Int32
+	permErr := errors.New("bad schema")
+	if err := gcPerm.Subscribe(kafka.Subscription{
+		Topic:       topic,
+		RetryPolicy: &kafka.RetryPolicy{Strategy: kafka.RetryStrategyInfinite},
+		Handler: func(ctx context.Context, msg *kafka.Message) error {
+			permAttempts.Add(1)
+			return kafka.Permanent(permErr)
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pRunErr := gcPerm.Run(context.Background())
+	if !errors.Is(pRunErr, permErr) || permAttempts.Load() != 1 {
+		t.Fatalf("expected immediate stop on Permanent error with 1 attempt, got attempts=%d err=%v", permAttempts.Load(), pRunErr)
+	}
+}
+
+func TestIT17_TransactionalConsumerIsolation(t *testing.T) {
+	brokers := integrationBrokers(t)
+	topic := uniqueName("it17-txn")
+	createTestTopic(t, brokers, topic, 1)
+
+	sc := sarama.NewConfig()
+	sc.Producer.Idempotent = true
+	sc.Producer.RequiredAcks = sarama.WaitForAll
+	sc.Producer.Retry.Max = 5
+	sc.Net.MaxOpenRequests = 1
+	sc.Producer.Return.Successes = true
+	sc.Producer.Return.Errors = true
+	sc.Producer.Transaction.ID = uniqueName("txn-prod")
+
+	ap, err := sarama.NewAsyncProducer(brokers, sc)
+	if err != nil {
+		t.Fatalf("NewAsyncProducer transactional: %v", err)
+	}
+	defer ap.Close()
+
+	sendTxnRecord := func(val string, commit bool) {
+		t.Helper()
+		if err := ap.BeginTxn(); err != nil {
+			t.Fatalf("BeginTxn: %v", err)
+		}
+		ap.Input() <- &sarama.ProducerMessage{
+			Topic: topic,
+			Key:   sarama.StringEncoder("k"),
+			Value: sarama.StringEncoder(val),
+		}
+		select {
+		case <-ap.Successes():
+		case err := <-ap.Errors():
+			t.Fatalf("txn send error: %v", err)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for txn send ack")
+		}
+		if commit {
+			if err := ap.CommitTxn(); err != nil {
+				t.Fatalf("CommitTxn: %v", err)
+			}
+		} else {
+			if err := ap.AbortTxn(); err != nil {
+				t.Fatalf("AbortTxn: %v", err)
+			}
+		}
+	}
+
+	sendTxnRecord("committed-1", true)
+	sendTxnRecord("aborted-1", false)
+	sendTxnRecord("committed-2", true)
+
+	// 1. read_committed hides aborted-1 and delivers committed-1, committed-2.
+	ccRC := consumerCfgFor(uniqueName("grp-it17-rc"))
+	ccRC.IsolationLevel = kafka.IsolationReadCommitted
+	cRC, err := kafka.NewConsumer(brokerCfgFor(brokers), ccRC, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rcVals []string
+	var mu sync.Mutex
+	rcCtx, rcCancel := context.WithCancel(context.Background())
+	if err := cRC.Subscribe(kafka.Subscription{
+		Topic:       topic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
+		Handler: func(ctx context.Context, msg *kafka.Message) error {
+			mu.Lock()
+			rcVals = append(rcVals, string(msg.Value))
+			done := string(msg.Value) == "committed-2"
+			mu.Unlock()
+			if done {
+				rcCancel()
+			}
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cRC.Run(rcCtx); err != nil {
+		t.Fatalf("cRC Run: %v", err)
+	}
+	if !slices.Equal(rcVals, []string{"committed-1", "committed-2"}) {
+		t.Fatalf("read_committed expected [committed-1 committed-2], got %v", rcVals)
+	}
+
+	// 2. read_uncommitted sees aborted-1 as well.
+	ccRU := consumerCfgFor(uniqueName("grp-it17-ru"))
+	ccRU.IsolationLevel = kafka.IsolationReadUncommitted
+	cRU, err := kafka.NewConsumer(brokerCfgFor(brokers), ccRU, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ruVals []string
+	ruCtx, ruCancel := context.WithCancel(context.Background())
+	if err := cRU.Subscribe(kafka.Subscription{
+		Topic:       topic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
+		Handler: func(ctx context.Context, msg *kafka.Message) error {
+			mu.Lock()
+			ruVals = append(ruVals, string(msg.Value))
+			done := string(msg.Value) == "committed-2"
+			mu.Unlock()
+			if done {
+				ruCancel()
+			}
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cRU.Run(ruCtx); err != nil {
+		t.Fatalf("cRU Run: %v", err)
+	}
+	if !slices.Equal(ruVals, []string{"committed-1", "aborted-1", "committed-2"}) {
+		t.Fatalf("read_uncommitted expected [committed-1 aborted-1 committed-2], got %v", ruVals)
+	}
+}
+
+func TestIT18_ProducerPartitionersAndSustainedMultiTopicTraffic(t *testing.T) {
+	brokers := integrationBrokers(t)
+
+	// 1. Verify CRC32 (librdkafka-compatible) and Murmur2 partitioners deliver consistently per key.
+	partTopic := uniqueName("it18-part")
+	createTestTopic(t, brokers, partTopic, 4)
+
+	for _, partMode := range []string{"hash", "crc32", "murmur2"} {
+		pc := kafka.DefaultProducerConfig()
+		pc.Partitioner = partMode
+		prod, err := kafka.NewProducer(brokerCfgFor(brokers), pc)
+		if err != nil {
+			t.Fatalf("NewProducer %s: %v", partMode, err)
+		}
+		for i := 0; i < 4; i++ {
+			if err := prod.Publish(context.Background(), partTopic, []byte("gw-"+partMode), []byte(fmt.Sprintf("%s-%d", partMode, i))); err != nil {
+				_ = prod.Close()
+				t.Fatalf("Publish %s: %v", partMode, err)
+			}
+		}
+		_ = prod.Close()
+	}
+
+	// Verify identical keys for each partitioner landed on a single partition.
+	partByMode := map[string]map[int32]int{}
+	var mu sync.Mutex
+	pGroup := uniqueName("grp-it18-part")
+	cPart, err := kafka.NewConsumer(brokerCfgFor(brokers), consumerCfgFor(pGroup), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var totalPartMsgs atomic.Int32
+	pCtx, pCancel := context.WithCancel(context.Background())
+	if err := cPart.Subscribe(kafka.Subscription{
+		Topic:       partTopic,
+		RetryPolicy: kafka.DefaultRetryPolicy(),
+		Handler: func(ctx context.Context, msg *kafka.Message) error {
+			mode := strings.SplitN(string(msg.Value), "-", 2)[0]
+			mu.Lock()
+			if partByMode[mode] == nil {
+				partByMode[mode] = map[int32]int{}
+			}
+			partByMode[mode][msg.Partition]++
+			mu.Unlock()
+			if totalPartMsgs.Add(1) == 12 {
+				pCancel()
+			}
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cPart.Run(pCtx); err != nil {
+		t.Fatalf("cPart Run: %v", err)
+	}
+	for _, mode := range []string{"hash", "crc32", "murmur2"} {
+		if len(partByMode[mode]) != 1 {
+			t.Fatalf("expected all keyed messages for partitioner %s on 1 partition, got %+v", mode, partByMode[mode])
+		}
+	}
+
+	// 2. Sustained multi-topic concurrent producers + rebalancing consumer group.
+	topics := []string{uniqueName("it18-t0"), uniqueName("it18-t1"), uniqueName("it18-t2")}
+	for _, tp := range topics {
+		createTestTopic(t, brokers, tp, 2)
+	}
+
+	const perTopic = 60
+	totalExpected := len(topics) * perTopic
+
+	var prodWg sync.WaitGroup
+	for _, tp := range topics {
+		topicName := tp
+		prodWg.Add(1)
+		go func() {
+			defer prodWg.Done()
+			p, err := kafka.NewProducer(brokerCfgFor(brokers), kafka.DefaultProducerConfig())
+			if err != nil {
+				t.Errorf("NewProducer: %v", err)
+				return
+			}
+			defer p.Close()
+			for i := 0; i < perTopic; i++ {
+				if err := p.Publish(context.Background(), topicName, []byte(fmt.Sprintf("k-%d", i%4)), []byte(fmt.Sprintf("%s:%d", topicName, i))); err != nil {
+					t.Errorf("Publish %s: %v", topicName, err)
+					return
+				}
+			}
+		}()
+	}
+	prodWg.Wait()
+
+	groupID := uniqueName("grp-it18-sustained")
+	cc := consumerCfgFor(groupID)
+	cc.SessionTimeout = 6 * time.Second
+	cc.HeartbeatInterval = 1500 * time.Millisecond
+	cc.CommitInterval = 200 * time.Millisecond
+
+	received := map[string]int{}
+	makeConsumer := func() kafka.Consumer {
+		gc, err := kafka.NewConsumer(brokerCfgFor(brokers), cc, testLogger())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tp := range topics {
+			topicName := tp
+			if err := gc.Subscribe(kafka.Subscription{
+				Topic:       topicName,
+				RetryPolicy: kafka.DefaultRetryPolicy(),
+				Handler: func(ctx context.Context, msg *kafka.Message) error {
+					mu.Lock()
+					received[string(msg.Value)]++
+					mu.Unlock()
+					return nil
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return gc
+	}
+
+	m1 := makeConsumer()
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	d1 := make(chan error, 1)
+	go func() { d1 <- m1.Run(ctx1) }()
+
+	waitForCondition(t, 15*time.Second, "m1 consumes initial records", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(received) >= 10
+	})
+
+	// Trigger rebalance by adding m2 mid-stream, then stop m1 so m2 finishes remaining partitions.
+	m2 := makeConsumer()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	d2 := make(chan error, 1)
+	go func() { d2 <- m2.Run(ctx2) }()
+
+	waitForCondition(t, 15*time.Second, "m2 ready after rebalance", func() bool {
+		return m2.Health().Ready
+	})
+
+	cancel1()
+	if err := <-d1; err != nil {
+		t.Fatalf("m1 Run: %v", err)
+	}
+
+	waitForCondition(t, 30*time.Second, "all sustained multi-topic records consumed across rebalance", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(received) == totalExpected
+	})
+	cancel2()
+	if err := <-d2; err != nil {
+		t.Fatalf("m2 Run: %v", err)
 	}
 }

@@ -50,13 +50,14 @@ const (
 
 // ConsumerHealth provides a concurrency-safe snapshot of consumer group lifecycle and readiness.
 type ConsumerHealth struct {
-	State           ConsumerState
-	Ready           bool
-	AssignedClaims  int
-	LastError       string
-	LastErrorAt     time.Time
-	LastSessionAt   time.Time
-	LastProcessedAt time.Time
+	State            ConsumerState
+	Ready            bool
+	AssignedClaims   int
+	LastError        string
+	LastErrorAt      time.Time
+	LastSessionAt    time.Time
+	LastResolvedAt   time.Time
+	LastSuccessfulAt time.Time
 }
 
 // Subscription defines a topic subscription and its independent handler and retry policy.
@@ -64,7 +65,7 @@ type Subscription struct {
 	Topic          string
 	Handler        Handler
 	HandlerTimeout time.Duration // 0 means inherit ConsumerConfig.HandlerTimeout
-	RetryPolicy    *RetryPolicy  // nil means DefaultRetryPolicy()
+	RetryPolicy    *RetryPolicy  // required; use DefaultRetryPolicy() for bounded retries followed by discard
 	Interceptors   []Interceptor
 }
 
@@ -88,6 +89,9 @@ const (
 
 	// RetryStrategyLogAndIgnore retries up to MaxRetries, then logs, records discard, and marks the offset.
 	RetryStrategyLogAndIgnore RetryStrategy = "ignore"
+
+	// RetryStrategyStop retries up to MaxRetries, then stops the consumer with a terminal error without marking the offset.
+	RetryStrategyStop RetryStrategy = "stop"
 )
 
 // DLQFailurePolicy determines what happens if publishing to the DLQ fails after handler retries are exhausted.
@@ -106,7 +110,7 @@ const (
 
 // RetryPolicy defines the retry behavior for failed messages.
 type RetryPolicy struct {
-	// Strategy determines behavior after MaxRetries (default: RetryStrategyLogAndIgnore)
+	// Strategy determines behavior after MaxRetries (required: ignore, dlq, infinite, or stop)
 	Strategy RetryStrategy
 
 	// MaxRetries is the maximum number of retries (default: 3). Ignored if Strategy is Infinite.

@@ -37,16 +37,18 @@ func TestDefaultConstructorsIndependenceAndDefaults(t *testing.T) {
 
 	p := DefaultProducerConfig()
 	if p.MaxMessageBytes != 1000000 || p.RequiredAcks != -1 || p.Timeout != 10*time.Second ||
-		p.Compression != "snappy" || !p.Idempotent || p.MaxRetries != 3 || p.RetryBackoff != 100*time.Millisecond {
+		p.Compression != "snappy" || p.Partitioner != "hash" || !p.Idempotent ||
+		p.MaxRetries != 3 || p.RetryBackoff != 100*time.Millisecond {
 		t.Fatalf("unexpected DefaultProducerConfig: %+v", p)
 	}
 
 	c := DefaultConsumerConfig()
-	if c.GroupID != "" || c.InitialOffset != "newest" || c.BalanceStrategy != "roundrobin" ||
+	if c.GroupID != "" || c.InitialOffset != "oldest" || !c.ResetInvalidOffsets || c.BalanceStrategy != "roundrobin" ||
 		c.SessionTimeout != 10*time.Second || c.HeartbeatInterval != 3*time.Second ||
-		c.RebalanceTimeout != 60*time.Second || c.MaxProcessingTime != 30*time.Second ||
+		c.RebalanceTimeout != 60*time.Second || c.MaxProcessingTime != 100*time.Millisecond ||
 		c.CommitMode != CommitPeriodic || c.CommitInterval != 5*time.Second ||
-		c.HandlerTimeout != 30*time.Second || c.ShutdownTimeout != 30*time.Second {
+		c.HandlerTimeout != 30*time.Second || c.ShutdownTimeout != 30*time.Second ||
+		c.CloseTimeout != 5*time.Second {
 		t.Fatalf("unexpected DefaultConsumerConfig: %+v", c)
 	}
 }
@@ -491,14 +493,77 @@ func TestTLSSASLValidationAndFixtures(t *testing.T) {
 		t.Fatalf("expected error for unsupported SASL mechanism")
 	}
 
-	// Disabled TLS/SASL with stray fields does not enable them
-	disabled := DefaultBrokerConfig()
-	disabled.Brokers = []string{"localhost:9092"}
-	disabled.Auth.TLS.CertFile = filepath.Join(dir, "nonexistent.crt")
-	disabled.Auth.SASL.Username = "ignored"
-	nd, err := normalizeAndValidateBrokerConfig(disabled)
+	// F11: SASL PLAIN without TLS requires explicit AllowInsecurePlaintext opt-in.
+	plainNoTLS := DefaultBrokerConfig()
+	plainNoTLS.Brokers = []string{"localhost:9092"}
+	plainNoTLS.Auth.SASL = SASLConfig{
+		Enabled:   true,
+		Mechanism: "PLAIN",
+		Username:  "user",
+		Password:  "secret",
+	}
+	if _, err := normalizeAndValidateBrokerConfig(plainNoTLS); err == nil {
+		t.Fatalf("expected error for SASL PLAIN over unencrypted transport without AllowInsecurePlaintext")
+	}
+	plainNoTLS.Auth.SASL.AllowInsecurePlaintext = true
+	if _, err := normalizeAndValidateBrokerConfig(plainNoTLS); err != nil {
+		t.Fatalf("expected SASL PLAIN with explicit AllowInsecurePlaintext to succeed: %v", err)
+	}
+
+	// F11: Contradictory TLS/SASL options when disabled must be rejected.
+	for _, tc := range []struct {
+		name   string
+		mutate func(*BrokerConfig)
+	}{
+		{
+			name:   "disabled TLS with CertFile",
+			mutate: func(bc *BrokerConfig) { bc.Auth.TLS.CertFile = cert1File },
+		},
+		{
+			name:   "disabled TLS with KeyFile",
+			mutate: func(bc *BrokerConfig) { bc.Auth.TLS.KeyFile = key1File },
+		},
+		{
+			name:   "disabled TLS with CAFile",
+			mutate: func(bc *BrokerConfig) { bc.Auth.TLS.CAFile = caFile },
+		},
+		{
+			name:   "disabled TLS with InsecureSkipVerify",
+			mutate: func(bc *BrokerConfig) { bc.Auth.TLS.InsecureSkipVerify = true },
+		},
+		{
+			name:   "disabled SASL with Username",
+			mutate: func(bc *BrokerConfig) { bc.Auth.SASL.Username = "stray" },
+		},
+		{
+			name:   "disabled SASL with Password",
+			mutate: func(bc *BrokerConfig) { bc.Auth.SASL.Password = "stray" },
+		},
+		{
+			name:   "disabled SASL with AllowInsecurePlaintext",
+			mutate: func(bc *BrokerConfig) { bc.Auth.SASL.AllowInsecurePlaintext = true },
+		},
+		{
+			name:   "disabled SASL with non-default Mechanism",
+			mutate: func(bc *BrokerConfig) { bc.Auth.SASL.Mechanism = "SCRAM-SHA-256" },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultBrokerConfig()
+			cfg.Brokers = []string{"localhost:9092"}
+			tc.mutate(&cfg)
+			if _, err := normalizeAndValidateBrokerConfig(cfg); err == nil {
+				t.Fatalf("expected validation error for %s", tc.name)
+			}
+		})
+	}
+
+	// Valid unauthenticated DefaultBrokerConfig remains accepted.
+	plainDefault := DefaultBrokerConfig()
+	plainDefault.Brokers = []string{"localhost:9092"}
+	nd, err := normalizeAndValidateBrokerConfig(plainDefault)
 	if err != nil {
-		t.Fatalf("disabled auth should not validate unused paths: %v", err)
+		t.Fatalf("default unauthenticated broker config failed: %v", err)
 	}
 	dsc, err := buildBaseSaramaConfig(nd)
 	if err != nil {
@@ -530,10 +595,95 @@ func TestConfigEnvTagsPresent(t *testing.T) {
 
 	consumerType := reflect.TypeOf(ConsumerConfig{})
 	checkTag(consumerType, "BalanceStrategy", "BALANCE_STRATEGY")
+	checkTag(consumerType, "IsolationLevel", "ISOLATION_LEVEL")
+	checkTag(consumerType, "ResetInvalidOffsets", "RESET_INVALID_OFFSETS")
 	checkTag(consumerType, "RebalanceTimeout", "REBALANCE_TIMEOUT")
 	checkTag(consumerType, "CommitMode", "COMMIT_MODE")
 	checkTag(consumerType, "HandlerTimeout", "HANDLER_TIMEOUT")
 	checkTag(consumerType, "ShutdownTimeout", "SHUTDOWN_TIMEOUT")
+	checkTag(consumerType, "CloseTimeout", "CLOSE_TIMEOUT")
+
+	producerType := reflect.TypeOf(ProducerConfig{})
+	checkTag(producerType, "Partitioner", "PARTITIONER")
+
+	saslType := reflect.TypeOf(SASLConfig{})
+	checkTag(saslType, "AllowInsecurePlaintext", "ALLOW_INSECURE_PLAINTEXT")
+}
+
+func TestTopicNameValidationAndNewConfigMappings(t *testing.T) {
+	// F12: Topic name validation rules
+	validTopics := []string{"a", "orders.created", "telemetry_v1-prod", strings.Repeat("x", 249)}
+	for _, topic := range validTopics {
+		if err := validateTopicName(topic); err != nil {
+			t.Fatalf("expected valid topic %q, got %v", topic, err)
+		}
+	}
+	invalidTopics := []string{"", " ", " orders", "orders ", ".", "..", "a/b", "a*b", "topic$1", "bad topic", strings.Repeat("x", 250)}
+	for _, topic := range invalidTopics {
+		if err := validateTopicName(topic); err == nil {
+			t.Fatalf("expected invalid topic %q to be rejected", topic)
+		}
+	}
+
+	// F01, F05, F13, F15 mappings
+	broker := DefaultBrokerConfig()
+	broker.Brokers = []string{"localhost:9092"}
+
+	cc := DefaultConsumerConfig()
+	cc.GroupID = "grp-new"
+	cc.ResetInvalidOffsets = false
+	cc.IsolationLevel = IsolationReadCommitted
+	cc.CloseTimeout = 7 * time.Second
+	ncc, err := normalizeAndValidateConsumerConfig(cc)
+	if err != nil {
+		t.Fatalf("normalizeAndValidateConsumerConfig: %v", err)
+	}
+	cs, err := buildConsumerSaramaConfig(broker, ncc)
+	if err != nil {
+		t.Fatalf("buildConsumerSaramaConfig: %v", err)
+	}
+	if cs.Consumer.Group.ResetInvalidOffsets {
+		t.Fatalf("expected Sarama ResetInvalidOffsets=false")
+	}
+	if cs.Consumer.IsolationLevel != sarama.ReadCommitted {
+		t.Fatalf("expected Sarama ReadCommitted, got %v", cs.Consumer.IsolationLevel)
+	}
+
+	ccBadIso := DefaultConsumerConfig()
+	ccBadIso.GroupID = "grp-iso"
+	ccBadIso.IsolationLevel = IsolationLevel("serializable")
+	if _, err := normalizeAndValidateConsumerConfig(ccBadIso); err == nil {
+		t.Fatalf("expected error for invalid isolation_level")
+	}
+
+	ccBadClose := DefaultConsumerConfig()
+	ccBadClose.GroupID = "grp-close"
+	ccBadClose.CloseTimeout = -time.Second
+	if _, err := normalizeAndValidateConsumerConfig(ccBadClose); err == nil {
+		t.Fatalf("expected error for negative close_timeout")
+	}
+
+	for _, part := range []string{"hash", "crc32", "murmur2", "roundrobin", "random"} {
+		pc := DefaultProducerConfig()
+		pc.Partitioner = part
+		npc, err := normalizeAndValidateProducerConfig(pc)
+		if err != nil {
+			t.Fatalf("partitioner %q failed validation: %v", part, err)
+		}
+		ps, err := buildProducerSaramaConfig(broker, npc)
+		if err != nil {
+			t.Fatalf("partitioner %q failed sarama build: %v", part, err)
+		}
+		if ps.Producer.Partitioner == nil {
+			t.Fatalf("partitioner %q produced nil sarama Partitioner", part)
+		}
+	}
+
+	pcBad := DefaultProducerConfig()
+	pcBad.Partitioner = "fnv64"
+	if _, err := normalizeAndValidateProducerConfig(pcBad); err == nil {
+		t.Fatalf("expected error for unsupported partitioner")
+	}
 }
 
 func writeTestFile(t *testing.T, path string, data []byte) {

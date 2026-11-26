@@ -50,7 +50,7 @@ func NewTracingInterceptor(cfg TracingConfig) Interceptor {
 			panicked := true
 			defer func() {
 				if panicked {
-					endSpan(err)
+					endSpan(&handlerPanicError{})
 				}
 			}()
 			err = next(spanCtx, msg)

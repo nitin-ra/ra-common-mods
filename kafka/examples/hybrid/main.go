@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -117,11 +118,15 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	var wg sync.WaitGroup
+	var (
+		wg     sync.WaitGroup
+		failed atomic.Bool
+	)
 	runGroup := func(name string, gc kafka.Consumer) {
 		defer wg.Done()
 		if err := gc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			logger.Error("consumer group exited with error", "name", name, "error", err)
+			logger.Error("consumer group exited with error", "name", name, "error", err, "health", gc.Health())
+			failed.Store(true)
 			stop()
 		}
 	}
@@ -132,4 +137,8 @@ func main() {
 
 	fmt.Println("Hybrid consumers started. Press Ctrl+C to shut down.")
 	wg.Wait()
+
+	if failed.Load() {
+		os.Exit(1)
+	}
 }

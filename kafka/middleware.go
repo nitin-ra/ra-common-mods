@@ -2,7 +2,6 @@ package kafka
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"time"
 )
@@ -62,14 +61,15 @@ func RecoveryInterceptor(logger *slog.Logger) Interceptor {
 		return func(ctx context.Context, msg *Message) (err error) {
 			defer func() {
 				if r := recover(); r != nil {
-					panicErr := newHandlerPanicError(r)
+					panicErr := newHandlerPanicError(r).(*handlerPanicError)
 					err = panicErr
 					logger.Error("panic recovered",
 						"topic", msg.Topic,
 						"partition", msg.Partition,
 						"offset", msg.Offset,
 						"failure_category", "handler_panic",
-						"panic_type", fmt.Sprintf("%T", r),
+						"panic_type", panicErr.typeName,
+						"panic_frames", panicErr.frames,
 					)
 				}
 			}()

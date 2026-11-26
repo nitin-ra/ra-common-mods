@@ -137,6 +137,33 @@ func TestProducerNilEmptyAndHashKeys(t *testing.T) {
 	if firstPart != secondPart {
 		t.Fatalf("expected deterministic partition for identical non-nil key, got %d vs %d", firstPart, secondPart)
 	}
+
+	// F15: Verify CRC32 (librdkafka compatible) and Murmur2 partitioners handle nil vs empty vs keyed consistently.
+	for name, ctor := range map[string]sarama.PartitionerConstructor{
+		"crc32":   sarama.NewConsistentCRCHashPartitioner,
+		"murmur2": sarama.NewMurmur2Partitioner,
+	} {
+		part := ctor("topic-a")
+		p1, err := part.Partition(msgs[2], numPartitions)
+		if err != nil {
+			t.Fatalf("%s Partition 1: %v", name, err)
+		}
+		p2, err := part.Partition(msgs[3], numPartitions)
+		if err != nil {
+			t.Fatalf("%s Partition 2: %v", name, err)
+		}
+		if p1 != p2 {
+			t.Fatalf("%s deterministic partition mismatch: %d vs %d", name, p1, p2)
+		}
+		pe1, err := part.Partition(msgs[1], numPartitions)
+		if err != nil {
+			t.Fatalf("%s empty key: %v", name, err)
+		}
+		pe2, err := part.Partition(msgs[1], numPartitions)
+		if err != nil || pe1 != pe2 {
+			t.Fatalf("%s empty non-nil key must be deterministic", name)
+		}
+	}
 }
 
 func TestProducerContextAndConcurrencyAndClose(t *testing.T) {
@@ -185,13 +212,21 @@ func TestProducerContextAndConcurrencyAndClose(t *testing.T) {
 		}
 	})
 
-	t.Run("empty topic rejected and headers copied without mutating caller slice", func(t *testing.T) {
+	t.Run("invalid topic names rejected before marshal or SendMessage", func(t *testing.T) {
 		f := &fakeSyncProducer{}
 		p := newTestProducer(t, f, nil)
 		defer p.Close()
 
-		if err := p.Publish(context.Background(), " ", []byte("k"), []byte("v")); err == nil {
-			t.Fatalf("expected error for blank topic")
+		for _, badTopic := range []string{" ", ".", "..", "a/b", "bad topic", string(make([]byte, 250))} {
+			if err := p.Publish(context.Background(), badTopic, []byte("k"), []byte("v")); err == nil {
+				t.Fatalf("expected error for invalid topic %q", badTopic)
+			}
+			if err := p.PublishJSON(context.Background(), badTopic, "k", make(chan int)); err == nil {
+				t.Fatalf("expected PublishJSON error for invalid topic %q", badTopic)
+			}
+		}
+		if f.sentCount() != 0 {
+			t.Fatalf("expected 0 sends for invalid topics, got %d", f.sentCount())
 		}
 
 		callerHeaders := []RecordHeader{{Key: "h1", Value: []byte("v1")}}

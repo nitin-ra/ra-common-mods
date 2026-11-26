@@ -4,10 +4,42 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/IBM/sarama"
 )
+
+type cancelableDialer struct {
+	ctx    context.Context
+	dialer *net.Dialer
+}
+
+func (d *cancelableDialer) Dial(network, addr string) (net.Conn, error) {
+	if err := d.ctx.Err(); err != nil {
+		return nil, err
+	}
+	conn, err := d.dialer.DialContext(d.ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	stopAfter := context.AfterFunc(d.ctx, func() {
+		_ = conn.Close()
+	})
+	return &cancelOnCloseConn{Conn: conn, stopAfter: stopAfter}, nil
+}
+
+type cancelOnCloseConn struct {
+	net.Conn
+	stopAfter func() bool
+}
+
+func (c *cancelOnCloseConn) Close() error {
+	c.stopAfter()
+	return c.Conn.Close()
+}
 
 // ErrConsumerAlreadyRunning is returned when Subscribe or Run is called on a consumer that has already started.
 var ErrConsumerAlreadyRunning = errors.New("kafka: consumer has already started")
@@ -159,6 +191,16 @@ func isTerminalKError(kerr sarama.KError) bool {
 	}
 }
 
+func isTerminalErrorForConsumer(err error, resetInvalidOffsets bool) bool {
+	if isTerminalSaramaError(err) {
+		return true
+	}
+	if !resetInvalidOffsets && errors.Is(err, sarama.ErrOffsetOutOfRange) {
+		return true
+	}
+	return false
+}
+
 func classifyConsumerError(err error) string {
 	if err == nil {
 		return "none"
@@ -172,14 +214,88 @@ func classifyConsumerError(err error) string {
 	return "transient"
 }
 
+// SafeErrorCodeProvider can be implemented by application errors to expose a bounded,
+// non-sensitive error code for safe diagnostics, logs, DLQ metadata, and trace attributes.
+type SafeErrorCodeProvider interface {
+	SafeErrorCode() string
+}
+
+type codedError struct {
+	err  error
+	code string
+}
+
+func (e *codedError) Error() string         { return e.err.Error() }
+func (e *codedError) Unwrap() error         { return e.err }
+func (e *codedError) SafeErrorCode() string { return e.code }
+
+// WithErrorCode wraps err with an application-defined, bounded, non-sensitive diagnostic code
+// while preserving err through standard Go error unwrapping (errors.Is / errors.As).
+// Calling WithErrorCode(nil, code) returns nil.
+func WithErrorCode(err error, code string) error {
+	if err == nil {
+		return nil
+	}
+	return &codedError{
+		err:  err,
+		code: sanitizeErrorCode(code),
+	}
+}
+
+func sanitizeErrorCode(raw string) string {
+	const maxCodeLen = 64
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(min(len(raw), maxCodeLen))
+	for i := 0; i < len(raw) && b.Len() < maxCodeLen; i++ {
+		c := raw[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '.' || c == '_' || c == '-' || c == ':' {
+			b.WriteByte(c)
+		} else if c == ' ' || c == '/' {
+			b.WriteByte('_')
+		}
+	}
+	return strings.Trim(b.String(), "_")
+}
+
 type handlerPanicError struct {
 	typeName string
+	frames   []string
 	wrapped  error
+}
+
+func capturePanicFrames(skip, maxFrames int) []string {
+	pcs := make([]uintptr, maxFrames)
+	n := runtime.Callers(skip, pcs)
+	if n == 0 {
+		return nil
+	}
+	frames := runtime.CallersFrames(pcs[:n])
+	out := make([]string, 0, n)
+	for {
+		frame, more := frames.Next()
+		fn := frame.Function
+		if idx := strings.LastIndex(fn, "/"); idx >= 0 {
+			fn = fn[idx+1:]
+		}
+		if fn != "" {
+			out = append(out, fmt.Sprintf("%s:%d", fn, frame.Line))
+		}
+		if !more || len(out) >= maxFrames {
+			break
+		}
+	}
+	return out
 }
 
 func newHandlerPanicError(r any) error {
 	pe := &handlerPanicError{
 		typeName: fmt.Sprintf("%T", r),
+		frames:   capturePanicFrames(4, 6),
 	}
 	if err, ok := r.(error); ok {
 		pe.wrapped = err
@@ -219,6 +335,12 @@ func classifyFailureCategory(err error) string {
 	if errors.As(err, &de) {
 		return "dlq_publish_failed"
 	}
+	var provider SafeErrorCodeProvider
+	if errors.As(err, &provider) {
+		if code := sanitizeErrorCode(provider.SafeErrorCode()); code != "" {
+			return code
+		}
+	}
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		return "handler_timeout"
@@ -241,13 +363,30 @@ func classifyFailureCategory(err error) string {
 }
 
 func safeConsumerDiagnostic(err error) string {
+	return safeConsumerDiagnosticForConsumer(err, true)
+}
+
+func safeConsumerDiagnosticForConsumer(err error, resetInvalidOffsets bool) string {
 	if err == nil {
 		return ""
 	}
 	class := classifyConsumerError(err)
+	if isTerminalErrorForConsumer(err, resetInvalidOffsets) {
+		class = "terminal"
+	}
+	var pe *handlerPanicError
+	if errors.As(err, &pe) {
+		return class + ": handler_panic"
+	}
 	var de *dlqPublishError
 	if errors.As(err, &de) {
 		return class + ": dlq_publish_failed"
+	}
+	var provider SafeErrorCodeProvider
+	if errors.As(err, &provider) {
+		if code := sanitizeErrorCode(provider.SafeErrorCode()); code != "" {
+			return class + ": " + code
+		}
 	}
 	var kerr sarama.KError
 	if errors.As(err, &kerr) {
