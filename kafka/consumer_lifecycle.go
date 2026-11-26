@@ -374,6 +374,10 @@ func safeConsumerDiagnosticForConsumer(err error, resetInvalidOffsets bool) stri
 	if isTerminalErrorForConsumer(err, resetInvalidOffsets) {
 		class = "terminal"
 	}
+	return formatConsumerDiagnostic(err, class)
+}
+
+func formatConsumerDiagnostic(err error, class string) string {
 	var pe *handlerPanicError
 	if errors.As(err, &pe) {
 		return class + ": handler_panic"

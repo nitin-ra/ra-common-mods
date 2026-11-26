@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"os"
 	"os/exec"
+	"runtime/pprof"
 	"slices"
 	"strings"
 	"sync"
@@ -727,6 +729,158 @@ func TestIT06_DLQRetryBlocksAffectedPartitionUntilRecovered(t *testing.T) {
 	}
 }
 
+func TestIT06_ShutdownDuringBlockedDLQPublication(t *testing.T) {
+	brokers := integrationBrokers(t)
+	sourceTopic := uniqueName("it06-blocked-dlq-source")
+	dlqTopic := uniqueName("it06-blocked-dlq")
+	groupID := uniqueName("grp-it06-blocked-dlq")
+	createTestTopic(t, brokers, sourceTopic, 1)
+	sourceProducer, err := kafka.NewProducer(brokerCfgFor(brokers), kafka.DefaultProducerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceProducer.Close()
+	for range 3 {
+		if err := sourceProducer.Publish(t.Context(), sourceTopic, nil, []byte("record")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The real Sarama producer uses a separate TCP endpoint. Withhold Produce
+	// responses while keeping metadata reachable so its network retry can run.
+	dlqBroker := sarama.NewMockBroker(t, 1)
+	defer dlqBroker.Close()
+	responses := map[string]sarama.MockResponse{
+		"ApiVersionsRequest": sarama.NewMockApiVersionsResponse(t).SetApiKeys([]sarama.ApiVersionsResponseKey{
+			{ApiKey: 0, MinVersion: 0, MaxVersion: 8},  // Produce
+			{ApiKey: 3, MinVersion: 0, MaxVersion: 10}, // Metadata
+		}),
+		"MetadataRequest": sarama.NewMockMetadataResponse(t).
+			SetBroker(dlqBroker.Addr(), dlqBroker.BrokerID()).SetLeader(dlqTopic, 0, dlqBroker.BrokerID()),
+	}
+	dlqBroker.SetHandlerByMap(responses)
+	dlqBrokerCfg := brokerCfgFor([]string{dlqBroker.Addr()})
+	const producerReadTimeout = 750 * time.Millisecond
+	dlqBrokerCfg.ReadTimeout = producerReadTimeout
+	dlqBrokerCfg.DialTimeout = producerReadTimeout
+	dlqBrokerCfg.WriteTimeout = producerReadTimeout
+	producerCfg := kafka.DefaultProducerConfig()
+	producerCfg.Idempotent = false
+	producerCfg.MaxRetries = 1
+	producerCfg.RetryBackoff = 10 * time.Millisecond
+	producerCfg.Timeout = producerReadTimeout
+	dlqProducer, err := kafka.NewProducer(dlqBrokerCfg, producerCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dlqProducer.Close()
+	produceRequests := func() int {
+		count := 0
+		for _, exchange := range dlqBroker.History() {
+			if _, ok := exchange.Request.(*sarama.ProduceRequest); ok {
+				count++
+			}
+		}
+		return count
+	}
+
+	consumerCfg := consumerCfgFor(groupID)
+	consumerCfg.CommitMode = kafka.CommitSync
+	consumerCfg.ShutdownTimeout = 75 * time.Millisecond
+	consumerCfg.CloseTimeout = 100 * time.Millisecond
+	watchdog := &logSignal{contains: "consumer close teardown timeout exceeded", observed: make(chan struct{})}
+	consumer, err := kafka.NewConsumer(brokerCfgFor(brokers), consumerCfg,
+		slog.New(slog.NewTextHandler(watchdog, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer consumer.Close()
+	var handlerCalls atomic.Int32
+	if err := consumer.Subscribe(kafka.Subscription{
+		Topic: sourceTopic,
+		RetryPolicy: &kafka.RetryPolicy{
+			Strategy:         kafka.RetryStrategyDLQ,
+			DLQTopic:         dlqTopic,
+			DLQProducer:      dlqProducer,
+			DLQFailurePolicy: kafka.DLQFailureDiscard,
+		},
+		Handler: func(_ context.Context, msg *kafka.Message) error {
+			handlerCalls.Add(1)
+			if msg.Offset == 1 {
+				return kafka.Permanent(errors.New("poison record"))
+			}
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() {
+		var runErr error
+		pprof.Do(ctx, pprof.Labels("kafka-test-consumer", groupID), func(ctx context.Context) {
+			runErr = consumer.Run(ctx)
+		})
+		runDone <- runErr
+	}()
+	consumerGoroutinesPresent := func() bool {
+		// Sarama's response receivers are covered as well as the consumer's
+		// own goroutines. The producer was started outside this labeled scope.
+		var profile strings.Builder
+		if err := pprof.Lookup("goroutine").WriteTo(&profile, 1); err != nil {
+			t.Fatal(err)
+		}
+		return strings.Contains(profile.String(), groupID)
+	}
+	waitForCondition(t, 15*time.Second, "blocked Produce request reaches DLQ broker", func() bool {
+		return produceRequests() >= 1
+	})
+	cancelStart := time.Now()
+	cancel()
+	select {
+	case <-watchdog.observed:
+	case <-time.After(producerReadTimeout):
+		t.Fatal("consumer teardown watchdog did not fire during blocked publication")
+	}
+	select {
+	case err := <-runDone:
+		t.Fatalf("Run returned before the producer exhausted its network retry: %v", err)
+	default:
+	}
+	if !consumerGoroutinesPresent() {
+		t.Fatal("expected labeled consumer goroutines during the blocked send")
+	}
+	select {
+	case err := <-runDone:
+		if err != nil && !strings.Contains(err.Error(), "consumer group close:") {
+			t.Fatalf("Run returned an unexpected error after interrupted DLQ publication: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("consumer did not finish shutdown after the bounded producer operation")
+	}
+	shutdownDuration := time.Since(cancelStart)
+	if got := produceRequests(); got != 1+producerCfg.MaxRetries {
+		t.Fatalf("synchronous publisher made %d Produce attempts, want %d", got, 1+producerCfg.MaxRetries)
+	}
+	if got := handlerCalls.Load(); got != 2 {
+		t.Fatalf("handled %d records, want 2 with the record after the poison message untouched", got)
+	}
+	if got, ok := committedOffset(t, brokers, groupID, sourceTopic, 0); !ok || got != 1 {
+		t.Fatalf("committed offset = %d, present = %t; want 1 with the poison record unresolved", got, ok)
+	}
+	waitForCondition(t, 2*time.Second, "consumer goroutines and broker response receivers exit", func() bool {
+		return !consumerGoroutinesPresent()
+	})
+	t.Logf("shutdown took %s with a %s drain and %s consumer teardown timeout", shutdownDuration, consumerCfg.ShutdownTimeout, consumerCfg.CloseTimeout)
+
+	responses["ProduceRequest"] = sarama.NewMockProduceResponse(t)
+	dlqBroker.SetHandlerByMap(responses)
+	if err := dlqProducer.Publish(t.Context(), dlqTopic, nil, []byte("probe")); err != nil {
+		t.Fatalf("shared producer should still be usable after consumer shutdown: %v", err)
+	}
+}
+
 func TestIT07_RebalanceDuringRetryPreservesUnresolvedOffset(t *testing.T) {
 	brokers := integrationBrokers(t)
 	topic := uniqueName("it07-reb")
@@ -1418,12 +1572,48 @@ func TestIT12_GroupOffsetContinuityAndInitialOffsetReplay(t *testing.T) {
 	}
 }
 
+type logSignal struct {
+	contains string
+	observed chan struct{}
+	once     sync.Once
+}
+
+func (l *logSignal) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), l.contains) {
+		l.once.Do(func() { close(l.observed) })
+	}
+	return len(p), nil
+}
+
+// Install the Sarama logger before any broker goroutine can use it. Only the
+// saturation test activates the observer.
+var saturationLogTarget atomic.Pointer[logSignal]
+
+type saturationLogWriter struct{}
+
+func (saturationLogWriter) Write(p []byte) (int, error) {
+	if target := saturationLogTarget.Load(); target != nil {
+		return target.Write(p)
+	}
+	return len(p), nil
+}
+
+func init() {
+	sarama.Logger = log.New(saturationLogWriter{}, "", 0)
+}
+
 func TestIT13_PartitionSaturationDoesNotStallOtherTopics(t *testing.T) {
 	brokers := integrationBrokers(t)
 	satTopic := uniqueName("it13-sat")
 	fastTopic := uniqueName("it13-fast")
 	createTestTopic(t, brokers, satTopic, 1)
 	createTestTopic(t, brokers, fastTopic, 1)
+	saturation := &logSignal{
+		contains: "abandoned subscription to " + satTopic + "/0 because consuming was taking too long",
+		observed: make(chan struct{}),
+	}
+	saturationLogTarget.Store(saturation)
+	defer saturationLogTarget.Store(nil)
 
 	reg := prometheus.NewRegistry()
 	metrics, err := kafka.NewMetrics(reg)
@@ -1457,6 +1647,7 @@ func TestIT13_PartitionSaturationDoesNotStallOtherTopics(t *testing.T) {
 	satBlocked := make(chan struct{})
 	var satOnce sync.Once
 	releaseSat := make(chan struct{})
+	var satResolved atomic.Int32
 	var fastCount atomic.Int32
 
 	if err := gc.Subscribe(kafka.Subscription{
@@ -1466,6 +1657,7 @@ func TestIT13_PartitionSaturationDoesNotStallOtherTopics(t *testing.T) {
 			satOnce.Do(func() { close(satBlocked) })
 			select {
 			case <-releaseSat:
+				satResolved.Add(1)
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -1486,6 +1678,8 @@ func TestIT13_PartitionSaturationDoesNotStallOtherTopics(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer gc.Close()
+	defer cancel()
 	runDone := make(chan error, 1)
 	go func() { runDone <- gc.Run(ctx) }()
 
@@ -1493,19 +1687,32 @@ func TestIT13_PartitionSaturationDoesNotStallOtherTopics(t *testing.T) {
 		return gc.Health().Ready
 	})
 
-	// Publish > ChannelBufferSize (256) records to satTopic to saturate its internal buffer while handler is blocked.
-	const satRecords = 350
+	// One record is held by the blocked handler. The rest must exceed the channel capacity.
+	bufferSize := sarama.NewConfig().ChannelBufferSize
+	const workers = 5
+	recordsPerWorker := (bufferSize+1)/workers + 1
 	var pubWg sync.WaitGroup
-	for w := 0; w < 5; w++ {
-		pubWg.Add(1)
-		go func(worker int) {
-			defer pubWg.Done()
-			for i := 0; i < satRecords/5; i++ {
-				_ = prod.Publish(context.Background(), satTopic, []byte("sat"), []byte(fmt.Sprintf("sat-%d-%d", worker, i)))
+	results := make(chan error, workers*recordsPerWorker)
+	for worker := range workers {
+		pubWg.Go(func() {
+			for i := range recordsPerWorker {
+				results <- prod.Publish(ctx, satTopic, []byte("sat"), []byte(fmt.Sprintf("sat-%d-%d", worker, i)))
 			}
-		}(w)
+		})
 	}
 	pubWg.Wait()
+	close(results)
+	published := 0
+	for err := range results {
+		if err != nil {
+			t.Errorf("publish to saturated partition: %v", err)
+		} else {
+			published++
+		}
+	}
+	if published != workers*recordsPerWorker || published-1 <= bufferSize {
+		t.Fatalf("published %d records, one in flight and channel capacity %d", published, bufferSize)
+	}
 
 	select {
 	case <-satBlocked:
@@ -1513,8 +1720,11 @@ func TestIT13_PartitionSaturationDoesNotStallOtherTopics(t *testing.T) {
 		t.Fatalf("satTopic handler did not start blocking")
 	}
 
-	// Allow Sarama's responseFeeder to fill the 256-entry buffer and hit MaxProcessingTime (100ms).
-	time.Sleep(400 * time.Millisecond)
+	select {
+	case <-saturation.observed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Sarama did not report backpressure on the blocked partition")
+	}
 
 	// Now publish 20 messages to fastTopic; they must make prompt progress despite satTopic saturation.
 	const fastRecords = 20
@@ -1528,6 +1738,9 @@ func TestIT13_PartitionSaturationDoesNotStallOtherTopics(t *testing.T) {
 	waitForCondition(t, 5*time.Second, "fastTopic completes while satTopic buffer is saturated", func() bool {
 		return fastCount.Load() == fastRecords
 	})
+	if got := satResolved.Load(); got != 0 {
+		t.Fatalf("blocked partition resolved %d records before fast topic finished", got)
+	}
 	t.Logf("fastTopic processed %d records in %s while %s was saturated", fastRecords, time.Since(fastStart), satTopic)
 
 	// Verify observed in-process backlog and updated timestamp metrics were populated for satTopic.
@@ -1818,6 +2031,103 @@ func TestIT15_InvalidOffsetRecoveryAndFailClosed(t *testing.T) {
 	if replayed != "first-event" {
 		t.Fatalf("expected interrupted first-event to replay under default oldest, got %q", replayed)
 	}
+}
+
+func TestIT15_InvalidOffsetAboveLogEndCommitsAndResumes(t *testing.T) {
+	brokers := integrationBrokers(t)
+	topic := uniqueName("it15-above-log-end")
+	groupID := uniqueName("grp-it15-above-log-end")
+	createTestTopic(t, brokers, topic, 1)
+
+	producer, err := kafka.NewProducer(brokerCfgFor(brokers), kafka.DefaultProducerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer producer.Close()
+	for range 5 {
+		if err := producer.Publish(context.Background(), topic, nil, []byte("record")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	client, err := sarama.NewClient(brokers, sarama.NewConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if end, err := client.GetOffset(topic, 0, sarama.OffsetNewest); err != nil || end != 5 {
+		t.Fatalf("log end = %d, err = %v; want 5", end, err)
+	}
+	coordinator, err := client.Coordinator(groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const invalidOffset = 1000
+	request := &sarama.OffsetCommitRequest{Version: 2, ConsumerGroup: groupID, ConsumerGroupGeneration: -1}
+	request.AddBlock(topic, 0, invalidOffset, 0, "")
+	response, err := coordinator.CommitOffset(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, ok := response.Errors[topic][0]; !ok || code != sarama.ErrNoError {
+		t.Fatalf("seeding invalid offset: %+v", response.Errors)
+	}
+
+	checkOffset := func(want int64) {
+		t.Helper()
+		if got, ok := committedOffset(t, brokers, groupID, topic, 0); !ok || got != want {
+			t.Fatalf("committed offset = %d, present = %t; want %d", got, ok, want)
+		}
+	}
+	checkOffset(invalidOffset)
+
+	var unresolved = errors.New("unresolved record")
+	run := func(reset bool, stopAt int64) ([]int64, error) {
+		t.Helper()
+		cfg := consumerCfgFor(groupID)
+		cfg.CommitMode = kafka.CommitSync
+		cfg.ResetInvalidOffsets = reset
+		consumer, err := kafka.NewConsumer(brokerCfgFor(brokers), cfg, testLogger())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer consumer.Close()
+		var received []int64
+		if err := consumer.Subscribe(kafka.Subscription{
+			Topic:       topic,
+			RetryPolicy: &kafka.RetryPolicy{Strategy: kafka.RetryStrategyStop},
+			Handler: func(_ context.Context, msg *kafka.Message) error {
+				received = append(received, msg.Offset)
+				if msg.Offset == stopAt {
+					return unresolved
+				}
+				return nil
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		err = consumer.Run(ctx)
+		return received, err
+	}
+
+	if received, err := run(false, 0); !errors.Is(err, sarama.ErrOffsetOutOfRange) || len(received) != 0 {
+		t.Fatalf("fail-closed run received %v, err %v; want no delivery and ErrOffsetOutOfRange", received, err)
+	}
+	checkOffset(invalidOffset)
+	if received, err := run(true, 0); !errors.Is(err, unresolved) || !slices.Equal(received, []int64{0}) {
+		t.Fatalf("unresolved recovery received %v, err %v; want [0] and handler error", received, err)
+	}
+	checkOffset(invalidOffset)
+	if received, err := run(true, 2); !errors.Is(err, unresolved) || !slices.Equal(received, []int64{0, 1, 2}) {
+		t.Fatalf("recovery received %v, err %v; want [0 1 2] and handler error", received, err)
+	}
+	checkOffset(2)
+	if received, err := run(true, 4); !errors.Is(err, unresolved) || !slices.Equal(received, []int64{2, 3, 4}) {
+		t.Fatalf("restart received %v, err %v; want [2 3 4] and handler error", received, err)
+	}
+	checkOffset(4)
 }
 
 func TestIT16_RetryStopAndPermanentErrorIntegration(t *testing.T) {

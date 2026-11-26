@@ -26,16 +26,29 @@ type scenarioStatus struct {
 type scenarioReport struct {
 	mu      sync.Mutex
 	results map[string]scenarioStatus
+	cancel  context.CancelFunc
 }
 
-func newScenarioReport() *scenarioReport {
-	return &scenarioReport{results: make(map[string]scenarioStatus)}
+func newScenarioReport(cancel context.CancelFunc) *scenarioReport {
+	return &scenarioReport{results: make(map[string]scenarioStatus), cancel: cancel}
 }
 
-func (r *scenarioReport) set(name string, passed bool, reason string) {
+func (r *scenarioReport) set(name string, passed bool, reason string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, exists := r.results[name]; exists {
+		return false
+	}
 	r.results[name] = scenarioStatus{Passed: passed, Reason: reason}
+	return true
+}
+
+func (r *scenarioReport) runConsumer(ctx context.Context, c kafka.Consumer, l *slog.Logger, scenario string) {
+	if err := c.Run(ctx); err != nil {
+		l.Error("Consumer exited with error", "error", err)
+		r.set(scenario, false, err.Error())
+		r.cancel()
+	}
 }
 
 func (r *scenarioReport) logSummary(l *slog.Logger) {
@@ -90,13 +103,15 @@ func waitForConsumerReady(ctx context.Context, c kafka.Consumer, timeout time.Du
 
 func assertScenario(l *slog.Logger, report *scenarioReport, scenario string, cond bool, msg string, args ...any) {
 	if cond {
-		l.Info("assertion passed", "scenario", scenario)
-		report.set(scenario, true, "")
+		if report.set(scenario, true, "") {
+			l.Info("assertion passed", "scenario", scenario)
+		}
 		return
 	}
 	reason := fmt.Sprintf(msg, args...)
-	l.Error("assertion failed", "scenario", scenario, "reason", reason)
-	report.set(scenario, false, reason)
+	if report.set(scenario, false, reason) {
+		l.Error("assertion failed", "scenario", scenario, "reason", reason)
+	}
 }
 
 // Global constants for topics (usually these would be env vars)
@@ -164,6 +179,10 @@ type Payload struct {
 }
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	// 1. Initialize Logger
 	logCfg := logger.Config{
 		ServiceName:    "kafka-advanced-example",
@@ -216,26 +235,19 @@ func main() {
 	producer, err := kafka.NewProducer(brokerCfg, producerCfg)
 	if err != nil {
 		l.Error("Failed to create producer", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	defer producer.Close()
 
 	// 4. Create Context
-	ctx, cancel := context.WithCancel(context.Background())
+	signalCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithCancel(signalCtx)
 	defer cancel()
-
-	// Handle shutdown
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sig
-		l.Info("Shutdown signal received")
-		cancel()
-	}()
 
 	// 5. Initialize Chaos State
 	chaos := NewChaosState()
-	report := newScenarioReport()
+	report := newScenarioReport(cancel)
 
 	var wg sync.WaitGroup
 
@@ -271,9 +283,10 @@ func main() {
 	report.logSummary(l)
 	if !report.allPassed() {
 		l.Error("One or more scenarios failed")
-		os.Exit(1)
+		return 1
 	}
 	l.Info("All scenarios completed")
+	return 0
 }
 
 // --- Scenario Helpers ---
@@ -345,9 +358,7 @@ func runRetrySuccessScenario(ctx context.Context, parentLog *slog.Logger, broker
 		return
 	}
 
-	if err := consumer.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		l.Error("Consumer exited with error", "error", err)
-	}
+	report.runConsumer(runCtx, consumer, l, "retry-success")
 	assertScenario(l, report, "retry-success", retrySuccessVerified.Load(), "message %q was never processed successfully", msgID)
 	l.Info("Scenario: Retry Success - Finished")
 }
@@ -436,10 +447,7 @@ func runDLQScenario(ctx context.Context, parentLog *slog.Logger, brokerCfg kafka
 			return
 		}
 
-		if err := consumer.Run(mainCtx); err != nil &&
-			!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			l.Error("DLQ scenario consumer exited with error", "error", err)
-		}
+		report.runConsumer(mainCtx, consumer, l, "dlq")
 	}()
 
 	// Routine B: DLQ Verifier (Listening on TopicDLQTarget)
@@ -472,19 +480,11 @@ func runDLQScenario(ctx context.Context, parentLog *slog.Logger, brokerCfg kafka
 			return
 		}
 
-		if err := dlqVerifier.Run(dlqCtx); err != nil &&
-			!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			l.Error("DLQ verifier exited with error", "error", err)
-		}
+		report.runConsumer(dlqCtx, dlqVerifier, l, "dlq")
 	}()
 
 	wg.Wait()
 
-	if dlqReceived.Load() {
-		l.Info("Scenario: DLQ - VERIFIED SUCCESS")
-	} else {
-		l.Error("Scenario: DLQ - FAILED (Message not received in DLQ)")
-	}
 	assertScenario(l, report, "dlq", dlqReceived.Load(), "expected message was not received in DLQ")
 }
 
@@ -556,10 +556,7 @@ func runConcurrencyScenario(ctx context.Context, parentLog *slog.Logger, brokerC
 				return
 			}
 
-			if err := c.Run(concCtx); err != nil &&
-				!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-				wLog.Error("Worker consumer exited with error", "error", err)
-			}
+			report.runConsumer(concCtx, c, wLog, "concurrency")
 		}()
 	}
 
@@ -641,18 +638,12 @@ func runMultiConsumerScenario(ctx context.Context, parentLog *slog.Logger, broke
 
 	go func() {
 		defer wg.Done()
-		if err := cA.Run(ctxA); err != nil &&
-			!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			l.Error("Service A consumer exited with error", "error", err)
-		}
+		report.runConsumer(ctxA, cA, l, "multi-consumer")
 	}()
 
 	go func() {
 		defer wg.Done()
-		if err := cB.Run(ctxB); err != nil &&
-			!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			l.Error("Service B consumer exited with error", "error", err)
-		}
+		report.runConsumer(ctxB, cB, l, "multi-consumer")
 	}()
 
 	// Wait deterministically for both consumers to report readiness before publishing.

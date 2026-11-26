@@ -134,14 +134,24 @@ func mockApiVersionsWithSASL(t *testing.T) *sarama.MockApiVersionsResponse {
 	return sarama.NewMockApiVersionsResponse(t).SetApiKeys([]sarama.ApiVersionsResponseKey{
 		{ApiKey: 0, MinVersion: 0, MaxVersion: 8},  // Produce
 		{ApiKey: 1, MinVersion: 0, MaxVersion: 11}, // Fetch
+		{ApiKey: 2, MinVersion: 0, MaxVersion: 5},  // ListOffsets
 		{ApiKey: 3, MinVersion: 0, MaxVersion: 10}, // Metadata
+		{ApiKey: 8, MinVersion: 0, MaxVersion: 7},  // OffsetCommit
+		{ApiKey: 9, MinVersion: 0, MaxVersion: 7},  // OffsetFetch
+		{ApiKey: 10, MinVersion: 0, MaxVersion: 3}, // FindCoordinator
+		{ApiKey: 11, MinVersion: 0, MaxVersion: 5}, // JoinGroup
+		{ApiKey: 12, MinVersion: 0, MaxVersion: 3}, // Heartbeat
+		{ApiKey: 13, MinVersion: 0, MaxVersion: 4}, // LeaveGroup
+		{ApiKey: 14, MinVersion: 0, MaxVersion: 3}, // SyncGroup
 		{ApiKey: 17, MinVersion: 0, MaxVersion: 1}, // SaslHandshake
 		{ApiKey: 22, MinVersion: 0, MaxVersion: 4}, // InitProducerID
 		{ApiKey: 36, MinVersion: 0, MaxVersion: 2}, // SaslAuthenticate
 	})
 }
 
-func TestAuthTLSSASL_MTLSAndPLAINWireHandshake(t *testing.T) {
+func TestAuthTLSSASL_MTLSAndPLAINMockBrokerConsumerGroup(t *testing.T) {
+	const topic, group, member = "tls-topic", "mtls-group", "mtls-member"
+	const generation = 3
 	pki := generateTestPKI(t, true)
 	listener, err := tls.Listen("tcp", "127.0.0.1:0", pki.serverTLS)
 	if err != nil {
@@ -158,9 +168,24 @@ func TestAuthTLSSASL_MTLSAndPLAINWireHandshake(t *testing.T) {
 		"MetadataRequest": sarama.NewMockMetadataResponse(t).
 			SetBroker(mb.Addr(), mb.BrokerID()).
 			SetController(mb.BrokerID()).
-			SetLeader("tls-topic", 0, mb.BrokerID()),
+			SetLeader(topic, 0, mb.BrokerID()),
 		"InitProducerIDRequest": sarama.NewMockInitProducerIDResponse(t).SetProducerID(42),
 		"ProduceRequest":        sarama.NewMockProduceResponse(t),
+		"FindCoordinatorRequest": sarama.NewMockFindCoordinatorResponse(t).
+			SetCoordinator(sarama.CoordinatorGroup, group, mb),
+		"JoinGroupRequest": sarama.NewMockJoinGroupResponse(t).
+			SetMemberId(member).SetGenerationId(generation).SetGroupProtocol(sarama.RoundRobinBalanceStrategyName),
+		"SyncGroupRequest": sarama.NewMockSyncGroupResponse(t).
+			SetMemberAssignment(&sarama.ConsumerGroupMemberAssignment{Topics: map[string][]int32{topic: {0}}}),
+		"HeartbeatRequest": sarama.NewMockHeartbeatResponse(t),
+		"OffsetFetchRequest": sarama.NewMockOffsetFetchResponse(t).
+			SetOffset(group, topic, 0, 7, "", sarama.ErrNoError),
+		"OffsetRequest": sarama.NewMockOffsetResponse(t).
+			SetOffset(topic, 0, sarama.OffsetOldest, 0).SetOffset(topic, 0, sarama.OffsetNewest, 8),
+		"FetchRequest": sarama.NewMockFetchResponse(t, 1).
+			SetMessage(topic, 0, 7, sarama.StringEncoder("v1")).SetHighWaterMark(topic, 0, 8),
+		"OffsetCommitRequest": sarama.NewMockOffsetCommitResponse(t),
+		"LeaveGroupRequest":   sarama.NewMockLeaveGroupResponse(t),
 	})
 
 	brokerCfg := DefaultBrokerConfig()
@@ -185,7 +210,7 @@ func TestAuthTLSSASL_MTLSAndPLAINWireHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProducer over mTLS+SASL/PLAIN: %v", err)
 	}
-	if err := prod.Publish(context.Background(), "tls-topic", []byte("k1"), []byte("v1")); err != nil {
+	if err := prod.Publish(context.Background(), topic, []byte("k1"), []byte("v1")); err != nil {
 		_ = prod.Close()
 		t.Fatalf("Publish over mTLS+SASL/PLAIN: %v", err)
 	}
@@ -193,14 +218,73 @@ func TestAuthTLSSASL_MTLSAndPLAINWireHandshake(t *testing.T) {
 		t.Fatalf("prod.Close: %v", err)
 	}
 
+	producerExchanges := len(mb.History())
 	cc := DefaultConsumerConfig()
-	cc.GroupID = "mtls-group"
-	cons, err := NewConsumer(brokerCfg, cc, nil)
+	cc.GroupID = group
+	cc.CommitMode = CommitSync
+	cons, err := NewConsumer(brokerCfg, cc, discardLogger())
 	if err != nil {
 		t.Fatalf("NewConsumer over mTLS+SASL/PLAIN: %v", err)
 	}
+	defer cons.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var received *Message
+	var ready bool
+	if err := cons.Subscribe(Subscription{
+		Topic:       topic,
+		RetryPolicy: DefaultRetryPolicy(),
+		Handler: func(_ context.Context, msg *Message) error {
+			received = msg
+			ready = cons.Health().Ready
+			cancel()
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cons.Run(ctx); err != nil {
+		t.Fatalf("authenticated consumer Run: %v", err)
+	}
+	if !ready || received == nil || received.Topic != topic || received.Partition != 0 || received.Offset != 7 || string(received.Value) != "v1" {
+		t.Fatalf("expected ready consumer to receive mock record at %s/0@7, ready=%t record=%+v", topic, ready, received)
+	}
+	if health := cons.Health(); health.State != ConsumerStateStopped || health.Ready || health.LastSuccessfulAt.IsZero() {
+		t.Fatalf("expected successful processing and clean shutdown, got %+v", health)
+	}
 	if err := cons.Close(); err != nil {
 		t.Fatalf("cons.Close: %v", err)
+	}
+
+	var authenticated, joined, synced, fetched, committed, left bool
+	for _, exchange := range mb.History()[producerExchanges:] {
+		switch req := exchange.Request.(type) {
+		case *sarama.SaslAuthenticateRequest:
+			authenticated = true
+		case *sarama.JoinGroupRequest:
+			joined = authenticated && req.GroupId == group
+		case *sarama.SyncGroupRequest:
+			synced = joined && req.GroupId == group && req.MemberId == member && req.GenerationId == generation
+		case *sarama.FetchRequest:
+			fetched = fetched || synced
+		case *sarama.OffsetCommitRequest:
+			offset, _, err := req.Offset(topic, 0)
+			response, ok := exchange.Response.(*sarama.OffsetCommitResponse)
+			if err != nil || offset != 8 || req.ConsumerID != member || req.ConsumerGroup != group ||
+				req.ConsumerGroupGeneration != generation || !ok {
+				t.Fatalf("unexpected authenticated commit: offset=%d err=%v request=%+v response=%+v", offset, err, req, exchange.Response)
+			}
+			if code, present := response.Errors[topic][0]; !present || code != sarama.ErrNoError {
+				t.Fatalf("mock broker did not acknowledge the authenticated commit: %+v", response.Errors)
+			}
+			committed = fetched
+		case *sarama.LeaveGroupRequest:
+			left = committed && req.GroupId == group
+		}
+	}
+	if !left {
+		t.Fatalf("incomplete consumer exchange: authenticated=%t joined=%t synced=%t fetched=%t committed=%t left=%t",
+			authenticated, joined, synced, fetched, committed, left)
 	}
 }
 

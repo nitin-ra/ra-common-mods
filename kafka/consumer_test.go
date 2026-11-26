@@ -1175,6 +1175,147 @@ func TestConsumerCloseDuringStalledSyncCommit(t *testing.T) {
 	}
 }
 
+func TestReadinessInvalidatesOnSessionCancellationBeforeCleanup(t *testing.T) {
+	gc, err := NewConsumer(testBrokerConfig(), testConsumerConfig("session-cancellation"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := gc.(*consumer)
+	h := &consumerGroupHandler{consumer: c, commitMode: CommitSync}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	commitStarted := make(chan struct{})
+	allowCommit := make(chan struct{})
+	releaseCommit := sync.OnceFunc(func() { close(allowCommit) })
+	defer releaseCommit()
+	first := &blockingCommitSession{
+		fakeSession: newFakeSession(ctx, map[string][]int32{"orders": {0}}),
+		commit: func() {
+			close(commitStarted)
+			<-allowCommit
+		},
+	}
+	if err := h.Setup(first); err != nil {
+		t.Fatal(err)
+	}
+	seq := h.currentSessionSeq.Load()
+	c.markClaimInitialized(ctx, seq, "orders", 0)
+	if health := c.Health(); !health.Ready || health.State != ConsumerStateRunning {
+		t.Fatalf("initialized session should be ready: %+v", health)
+	}
+	waitUnready := func() {
+		t.Helper()
+		deadline := time.NewTimer(2 * time.Second)
+		defer deadline.Stop()
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for c.Health().Ready {
+			select {
+			case <-deadline.C:
+				t.Fatal("session cancellation did not invalidate readiness before Cleanup")
+			case <-ticker.C:
+			}
+		}
+	}
+	cancel()
+	waitUnready()
+	c.markClaimInitialized(ctx, seq, "orders", 0)
+	h.hasMarked.Store(true)
+	cleanupDone := make(chan error, 1)
+	go func() { cleanupDone <- h.Cleanup(first) }()
+	select {
+	case <-commitStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Cleanup did not enter the synchronous commit")
+	}
+	if health := c.Health(); health.Ready || health.State != ConsumerStateRebalancing || health.AssignedClaims != 1 {
+		t.Fatalf("cancelled session should be unready while cleanup commits: %+v", health)
+	}
+	releaseCommit()
+	if err := <-cleanupDone; err != nil {
+		t.Fatal(err)
+	}
+	if h.stopSessionWatcher != nil {
+		t.Fatal("Cleanup retained the session cancellation callback")
+	}
+
+	nextCtx, nextCancel := context.WithCancel(t.Context())
+	defer nextCancel()
+	next := newFakeSession(nextCtx, nil)
+	if err := h.Setup(next); err != nil {
+		t.Fatal(err)
+	}
+	c.invalidateSessionReadiness(seq) // An obsolete callback must leave the new session alone.
+	if health := c.Health(); !health.Ready || health.State != ConsumerStateRunning || health.AssignedClaims != 0 {
+		t.Fatalf("new zero-claim session should be ready: %+v", health)
+	}
+	nextCancel()
+	waitUnready()
+	if err := h.Cleanup(next); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTerminalProcessingDiagnostics(t *testing.T) {
+	handlerErr := errors.New("sensitive handler details")
+	publishErr := errors.New("sensitive publish details")
+	for _, tc := range []struct {
+		name       string
+		handlerErr error
+		strategy   RetryStrategy
+		diagnostic string
+	}{
+		{"exhausted retries", handlerErr, RetryStrategyStop, "terminal: consumer_error"},
+		{"handler cancellation", context.Canceled, RetryStrategyStop, "terminal: context_canceled"},
+		{"permanent handler error", Permanent(WithErrorCode(handlerErr, "invalid_payload")), RetryStrategyInfinite, "terminal: invalid_payload"},
+		{"DLQ stop", handlerErr, RetryStrategyDLQ, "terminal: dlq_publish_failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fg := newFakeConsumerGroup()
+			var healthAtFailure ConsumerHealth
+			gc, err := NewConsumer(testBrokerConfig(), testConsumerConfig("terminal-diagnostic"), discardLogger(), func(o *consumerOptions) {
+				o.consumerGroupFactory = func([]string, string, *sarama.Config) (consumerGroupClient, error) { return fg, nil }
+				o.sleepFn = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer gc.Close()
+			fg.consumeFn = func(ctx context.Context, _ []string, handler sarama.ConsumerGroupHandler) error {
+				claim := newFakeClaim("orders", 0, &sarama.ConsumerMessage{Topic: "orders"})
+				_, err := runFakeSession(ctx, handler, claim)
+				healthAtFailure = gc.Health()
+				fg.errCh <- &sarama.ConsumerError{Topic: "orders", Err: sarama.ErrNotConnected}
+				return err
+			}
+			policy := &RetryPolicy{Strategy: tc.strategy, MaxRetries: 1}
+			if tc.strategy == RetryStrategyDLQ {
+				policy.DLQTopic = "orders-dlq"
+				policy.DLQProducer = &mockDLQProducer{publishF: func(context.Context, string, []byte, []byte, []RecordHeader) error {
+					return publishErr
+				}}
+				policy.DLQFailurePolicy = DLQFailureStop
+			}
+			if err := gc.Subscribe(Subscription{
+				Topic: "orders", RetryPolicy: policy,
+				Handler: func(context.Context, *Message) error { return tc.handlerErr },
+			}); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			err = gc.Run(ctx)
+			if !errors.Is(err, tc.handlerErr) || (tc.strategy == RetryStrategyDLQ && !errors.Is(err, publishErr)) {
+				t.Fatalf("Run did not preserve the original error chain: %v", err)
+			}
+			if health := gc.Health(); health.State != ConsumerStateFailed || health.Ready || health.LastError != tc.diagnostic ||
+				health.LastErrorAt.IsZero() || !health.LastErrorAt.Equal(healthAtFailure.LastErrorAt) {
+				t.Fatalf("expected %q to survive the delayed transient error; original %+v, final %+v", tc.diagnostic, healthAtFailure, health)
+			}
+		})
+	}
+}
+
 func TestReadinessClaimInitializationAndHealthTimestamps(t *testing.T) {
 	t.Run("F04 readiness waits for all assigned claims to enter ConsumeClaim even on idle partitions", func(t *testing.T) {
 		fg := newFakeConsumerGroup()

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -18,6 +17,10 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	brokers := []string{"localhost:9092"}
@@ -38,7 +41,7 @@ func main() {
 	metrics, err := kafka.NewMetrics(reg)
 	if err != nil {
 		logger.Error("failed to init metrics", "error", err)
-		os.Exit(1)
+		return 1
 	}
 
 	// Shared producer (must stay open until consumers finish shutting down).
@@ -49,7 +52,7 @@ func main() {
 	)
 	if err != nil {
 		logger.Error("failed to create producer", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	defer dlqProducer.Close()
 
@@ -62,7 +65,7 @@ func main() {
 	criticalConsumer, err := kafka.NewConsumer(brokerCfg, criticalCfg, logger, kafka.WithConsumerMetrics(metrics))
 	if err != nil {
 		logger.Error("failed to create critical consumer", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	defer criticalConsumer.Close()
 
@@ -84,7 +87,7 @@ func main() {
 		},
 	}); err != nil {
 		logger.Error("subscribe critical.events failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 
 	// Background consumer group: multi-topic, periodic commits, availability-oriented policies.
@@ -95,7 +98,7 @@ func main() {
 	bgConsumer, err := kafka.NewConsumer(brokerCfg, bgCfg, logger, kafka.WithConsumerMetrics(metrics))
 	if err != nil {
 		logger.Error("failed to create background consumer", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	defer bgConsumer.Close()
 
@@ -111,7 +114,7 @@ func main() {
 			},
 		}); err != nil {
 			logger.Error("subscribe failed", "topic", tName, "error", err)
-			os.Exit(1)
+			return 1
 		}
 	}
 
@@ -124,7 +127,7 @@ func main() {
 	)
 	runGroup := func(name string, gc kafka.Consumer) {
 		defer wg.Done()
-		if err := gc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		if err := gc.Run(ctx); err != nil {
 			logger.Error("consumer group exited with error", "name", name, "error", err, "health", gc.Health())
 			failed.Store(true)
 			stop()
@@ -139,6 +142,7 @@ func main() {
 	wg.Wait()
 
 	if failed.Load() {
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }

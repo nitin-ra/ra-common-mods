@@ -86,7 +86,9 @@ func (p *producer) Publish(ctx context.Context, topic string, key, value []byte)
 	return p.PublishWithHeaders(ctx, topic, key, value, nil)
 }
 
-// PublishWithHeaders sends a message with custom headers.
+// PublishWithHeaders sends a message with custom headers. Context cancellation
+// can prevent admission. Once Sarama starts the synchronous send, its network
+// timeouts and retry budget govern completion.
 func (p *producer) PublishWithHeaders(ctx context.Context, topic string, key, value []byte, headers []RecordHeader) error {
 	if ctx == nil {
 		ctx = context.Background()

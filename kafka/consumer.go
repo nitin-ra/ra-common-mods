@@ -579,11 +579,9 @@ func (c *consumer) signalTerminalFailure(err error) {
 	cancelRun := c.cancelRun
 	c.stopRequested = true
 	c.ready = false
-	if c.terminalErr == nil {
+	if c.terminalErr == nil && err != nil {
 		c.terminalErr = err
-	}
-	if err != nil {
-		c.lastError = safeConsumerDiagnosticForConsumer(err, c.consumerCfg.ResetInvalidOffsets)
+		c.lastError = formatConsumerDiagnostic(err, "terminal")
 		c.lastErrorAt = time.Now()
 	}
 	c.mu.Unlock()
@@ -612,6 +610,10 @@ func (c *consumer) recordError(err error, preserveReadiness bool) {
 		return
 	}
 	c.mu.Lock()
+	if c.terminalErr != nil {
+		c.mu.Unlock()
+		return
+	}
 	c.lastError = safeConsumerDiagnosticForConsumer(err, c.consumerCfg.ResetInvalidOffsets)
 	c.lastErrorAt = time.Now()
 	if !preserveReadiness {
@@ -760,6 +762,7 @@ type consumerGroupHandler struct {
 
 	sessionEstablished atomic.Bool
 	currentSessionSeq  atomic.Uint64
+	stopSessionWatcher func()
 	commitMu           sync.Mutex
 	hasMarked          atomic.Bool
 }
@@ -789,8 +792,19 @@ func (h *consumerGroupHandler) Setup(session sarama.ConsumerGroupSession) error 
 		h.consumer.notifyRebalance()
 	}
 
-	seq := h.consumer.setupSessionClaims(expected)
+	sessionCtx := session.Context()
+	seq := h.consumer.setupSessionClaims(sessionCtx, expected)
 	h.currentSessionSeq.Store(seq)
+	watcherDone := make(chan struct{})
+	stopWatcher := context.AfterFunc(sessionCtx, func() {
+		defer close(watcherDone)
+		h.consumer.invalidateSessionReadiness(seq)
+	})
+	h.stopSessionWatcher = func() {
+		if !stopWatcher() {
+			<-watcherDone
+		}
+	}
 
 	h.consumer.publishReadiness()
 	h.consumer.logger.Info("consumer group session started",
@@ -803,7 +817,7 @@ func (h *consumerGroupHandler) Setup(session sarama.ConsumerGroupSession) error 
 	return nil
 }
 
-func (c *consumer) setupSessionClaims(expected map[topicPartitionKey]struct{}) uint64 {
+func (c *consumer) setupSessionClaims(ctx context.Context, expected map[topicPartitionKey]struct{}) uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -818,7 +832,7 @@ func (c *consumer) setupSessionClaims(expected map[topicPartitionKey]struct{}) u
 		c.state != ConsumerStateClosed && c.state != ConsumerStateDraining &&
 		c.state != ConsumerStateFailed && c.state != ConsumerStateStopped
 
-	if len(expected) == 0 && canBeReady {
+	if len(expected) == 0 && canBeReady && ctx.Err() == nil {
 		c.ready = true
 		c.state = ConsumerStateRunning
 	} else {
@@ -830,9 +844,9 @@ func (c *consumer) setupSessionClaims(expected map[topicPartitionKey]struct{}) u
 	return seq
 }
 
-func (c *consumer) markClaimInitialized(seq uint64, topic string, partition int32) {
+func (c *consumer) markClaimInitialized(ctx context.Context, seq uint64, topic string, partition int32) {
 	c.mu.Lock()
-	if seq == 0 || seq != c.activeSessionSeq {
+	if seq == 0 || seq != c.activeSessionSeq || ctx.Err() != nil {
 		c.mu.Unlock()
 		return
 	}
@@ -865,7 +879,27 @@ func (c *consumer) markClaimInitialized(seq uint64, topic string, partition int3
 	}
 }
 
+func (c *consumer) invalidateSessionReadiness(seq uint64) {
+	c.mu.Lock()
+	if seq != c.activeSessionSeq {
+		c.mu.Unlock()
+		return
+	}
+	c.ready = false
+	if c.state == ConsumerStateRunning {
+		c.state = ConsumerStateRebalancing
+	}
+	c.mu.Unlock()
+	c.publishReadiness()
+}
+
 func (h *consumerGroupHandler) Cleanup(session sarama.ConsumerGroupSession) error {
+	h.consumer.invalidateSessionReadiness(h.currentSessionSeq.Load())
+	if h.stopSessionWatcher != nil {
+		h.stopSessionWatcher()
+		h.stopSessionWatcher = nil
+	}
+
 	if h.commitMode == CommitSync && h.hasMarked.Load() {
 		h.commitMu.Lock()
 		h.consumer.notifyCommitAttempt()
@@ -884,13 +918,8 @@ func (h *consumerGroupHandler) Cleanup(session sarama.ConsumerGroupSession) erro
 	h.consumer.expectedClaims = nil
 	h.consumer.initializedClaims = nil
 	h.consumer.assignedClaims = 0
-	h.consumer.ready = false
-	if h.consumer.state == ConsumerStateRunning {
-		h.consumer.state = ConsumerStateRebalancing
-	}
 	h.consumer.mu.Unlock()
 
-	h.consumer.publishReadiness()
 	h.consumer.logger.Info("consumer group session ended",
 		"group_id", h.consumer.consumerCfg.GroupID,
 		"client_id", h.consumer.brokerCfg.ClientID,
@@ -912,13 +941,18 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 		return err
 	}
 
-	h.consumer.markClaimInitialized(h.currentSessionSeq.Load(), topic, partition)
+	h.consumer.markClaimInitialized(sessionCtx, h.currentSessionSeq.Load(), topic, partition)
+	initialOffset := claim.InitialOffset()
+	// Sarama falls back to the configured sentinel without resetting its offset
+	// manager. Reset on the first resolved record so a higher commit cannot mask it.
+	resetOnResolve := h.consumer.consumerCfg.ResetInvalidOffsets &&
+		(initialOffset == sarama.OffsetOldest || initialOffset == sarama.OffsetNewest)
 
 	rt := h.consumer.newRetryRuntime()
 	rt.onAttemptStart = func(m *Message) {
 		h.updateClaimLag(topic, partition, claim.HighWaterMarkOffset(), m.Offset)
 	}
-	h.updateClaimLag(topic, partition, claim.HighWaterMarkOffset(), claim.InitialOffset())
+	h.updateClaimLag(topic, partition, claim.HighWaterMarkOffset(), initialOffset)
 
 	for {
 		if sessionCtx.Err() != nil {
@@ -966,6 +1000,12 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 
 		switch res.Outcome {
 		case outcomeProcessed, outcomeDeadLettered, outcomeDiscarded:
+			if resetOnResolve {
+				// ResetOffset is a no-op for fresh groups and for commits below
+				// this offset. MarkMessage handles both cases as usual.
+				session.ResetOffset(topic, partition, msg.Offset+1, "")
+				resetOnResolve = false
+			}
 			session.MarkMessage(msg, "")
 			h.hasMarked.Store(true)
 			if h.commitMode == CommitSync {

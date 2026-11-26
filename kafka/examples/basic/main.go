@@ -3,13 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,6 +33,10 @@ type Config struct {
 }
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	var appCfg Config
 	if err := env.Parse(&appCfg); err != nil {
 		panic(err)
@@ -67,14 +69,14 @@ func main() {
 	producer, err := kafka.NewProducer(brokerCfg, producerCfg)
 	if err != nil {
 		aLog.Error("Failed to create producer", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	defer producer.Close()
 
 	consumer, err := kafka.NewConsumer(brokerCfg, consumerCfg, aLog)
 	if err != nil {
 		aLog.Error("Failed to create consumer", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	defer consumer.Close()
 
@@ -92,21 +94,19 @@ func main() {
 		RetryPolicy: kafka.DefaultRetryPolicy(),
 	}); err != nil {
 		aLog.Error("Subscribe failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 
 	var (
 		wg          sync.WaitGroup
-		failed      atomic.Bool
 		consumerErr error
 	)
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := consumer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		if err := consumer.Run(ctx); err != nil {
 			consumerErr = err
-			failed.Store(true)
 			aLog.Error("Consumer exited with terminal error; shutting down", "error", err)
 			stop()
 		}
@@ -119,10 +119,16 @@ func main() {
 	}()
 
 	if !waitForReady(ctx, consumer, 30*time.Second) {
-		aLog.Error("Consumer did not become ready before shutdown or timeout", "health", consumer.Health())
+		timedOut := ctx.Err() == nil
 		stop()
 		wg.Wait()
-		os.Exit(1)
+		if timedOut {
+			aLog.Error("Consumer did not become ready before timeout", "health", consumer.Health())
+		}
+		if timedOut || consumerErr != nil {
+			return 1
+		}
+		return 0
 	}
 
 	wg.Add(1)
@@ -142,11 +148,12 @@ func main() {
 	)
 	stats.mu.Unlock()
 
-	if failed.Load() {
+	if consumerErr != nil {
 		aLog.Error("Shutdown complete with consumer failure", "error", consumerErr)
-		os.Exit(1)
+		return 1
 	}
 	aLog.Info("Shutdown complete")
+	return 0
 }
 
 func waitForReady(ctx context.Context, c kafka.Consumer, timeout time.Duration) bool {

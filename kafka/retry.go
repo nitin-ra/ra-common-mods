@@ -534,6 +534,8 @@ func (rt *retryRuntime) handleDLQ(
 		}
 
 		dlqAttempt++
+		// Publication is synchronous and may outlive the session's cancellation.
+		// Check the session again before applying any DLQ disposition.
 		dlqErr := policy.DLQProducer.PublishWithHeaders(
 			sessionCtx,
 			policy.DLQTopic,

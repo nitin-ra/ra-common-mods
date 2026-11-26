@@ -166,7 +166,8 @@ type ConsumerConfig struct {
 	ShutdownTimeout time.Duration `json:"shutdown_timeout" yaml:"shutdown_timeout" env:"SHUTDOWN_TIMEOUT" envDefault:"30s"`
 
 	// CloseTimeout limits how long to wait before aborting pending consumer broker I/O
-	// once the drain completes or expires.
+	// once the drain completes or expires. Total shutdown can take longer when a
+	// handler or a synchronous DLQ producer is still blocked.
 	CloseTimeout time.Duration `json:"close_timeout" yaml:"close_timeout" env:"CLOSE_TIMEOUT" envDefault:"5s"`
 }
 
