@@ -19,7 +19,7 @@ The `kafka` module provides a thin, explicit wrapper over IBM Sarama (`v1.62.0`)
 4. **Retries & DLQ**:
    - **A nil `RetryPolicy` is rejected at `Subscribe` time**; callers must explicitly choose a strategy.
    - Bounded retries run up to `1 + MaxRetries` attempts with capped exponential backoff and full positive-floor jitter (`[delay/2, delay]`).
-   - `RetryStrategyDLQ` publishes the pre-handler snapshot with `x-original-*` metadata headers (`x-original-error` holds a safe failure classification). When DLQ publication fails, `DLQFailureDiscard` marks and continues, `DLQFailureRetry` retries only the DLQ write with backoff, and `DLQFailureStop` cancels the consumer run with a terminal error without marking the failed offset.
+   - `RetryStrategyDLQ` publishes the pre-handler snapshot with `x-original-*` metadata headers (`x-original-error` holds a safe failure classification). When DLQ publication fails, `DLQFailureDiscard` marks and continues, `DLQFailureRetry` retries only retryable DLQ writes with backoff, and `DLQFailureStop` stops the consumer without marking the failed offset. Known permanent publication errors also stop the consumer under `DLQFailureRetry` and leave the source offset unmarked.
    - `RetryStrategyStop` stops `Run` with a terminal error after exhausting retries, without publishing to a DLQ or discarding the message.
 5. **No exactly-once claims**: Kafka commit and handler/DLQ side effects are separate operations; duplicates are possible on crashes or rebalances, so handlers must be idempotent.
 

@@ -506,21 +506,30 @@ func TestRetryProcessingOutcomes(t *testing.T) {
 	})
 
 	t.Run("UT04_UT05 DLQ failure with discard vs stop", func(t *testing.T) {
-		dlq := &mockDLQProducer{
-			publishF: func(context.Context, string, []byte, []byte, []RecordHeader) error {
-				return errors.New("broker down")
-			},
-		}
-
+		transient := errors.New("broker down")
+		permanent := Permanent(errors.New("invalid DLQ record"))
 		for _, tc := range []struct {
 			fallback   DLQFailurePolicy
+			publishErr error
 			wantOut    disposition
 			wantReason string
 		}{
-			{DLQFailureDiscard, outcomeDiscarded, "dlq_failed"},
-			{DLQFailureStop, outcomeTerminalFailure, ""},
+			{DLQFailureDiscard, transient, outcomeDiscarded, "dlq_failed"},
+			{DLQFailureDiscard, permanent, outcomeDiscarded, "dlq_failed"},
+			{DLQFailureStop, transient, outcomeTerminalFailure, ""},
+			{DLQFailureStop, permanent, outcomeTerminalFailure, ""},
+			{DLQFailureRetry, permanent, outcomeTerminalFailure, ""},
 		} {
 			rt := newNoopRetryRuntime(nil)
+			var attempts []bool
+			rt.onDLQAttempt = func(_ string, success bool) { attempts = append(attempts, success) }
+			dlq := &mockDLQProducer{publishF: func(context.Context, string, []byte, []byte, []RecordHeader) error {
+				// Bound this regression if the implementation retries a permanent error.
+				if len(attempts) == 1 {
+					return nil
+				}
+				return tc.publishErr
+			}}
 			policy, err := normalizeAndValidateRetryPolicy("orders", &RetryPolicy{
 				Strategy:         RetryStrategyDLQ,
 				MaxRetries:       0,
@@ -536,6 +545,9 @@ func TestRetryProcessingOutcomes(t *testing.T) {
 			}, policy, time.Second)
 			if res.Outcome != tc.wantOut || res.DiscardReason != tc.wantReason {
 				t.Fatalf("fallback=%s: got %+v, want outcome=%v reason=%s", tc.fallback, res, tc.wantOut, tc.wantReason)
+			}
+			if len(attempts) != 1 || attempts[0] || !errors.Is(res.Err, tc.publishErr) {
+				t.Fatalf("fallback=%s: want one failed DLQ metric and original error, got %v and %v", tc.fallback, attempts, res.Err)
 			}
 		}
 	})
@@ -595,6 +607,19 @@ func TestRetryProcessingOutcomes(t *testing.T) {
 		}, policy, time.Second)
 		if res2.Outcome != outcomeInterrupted {
 			t.Fatalf("expected outcomeInterrupted on cancelled DLQ retry, got %+v", res2)
+		}
+
+		ctx, cancel = context.WithCancel(context.Background())
+		defer cancel()
+		policy.DLQProducer = &mockDLQProducer{publishF: func(context.Context, string, []byte, []byte, []RecordHeader) error {
+			cancel()
+			return Permanent(errors.New("invalid DLQ record"))
+		}}
+		res3 := rt.processMessage(ctx, baseMsg(), func(context.Context, *Message) error {
+			return errors.New("handler fail")
+		}, policy, time.Second)
+		if res3.Outcome != outcomeInterrupted || !errors.Is(res3.Err, context.Canceled) {
+			t.Fatalf("session cancellation should take precedence over a permanent DLQ result, got %+v", res3)
 		}
 	})
 

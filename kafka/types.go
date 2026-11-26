@@ -101,7 +101,7 @@ const (
 	// DLQFailureDiscard logs and discards the message and marks the source offset if the session is active.
 	DLQFailureDiscard DLQFailurePolicy = "discard"
 
-	// DLQFailureRetry retries DLQ publication with backoff until acknowledged or the session is cancelled.
+	// DLQFailureRetry retries transient DLQ failures with backoff and stops the consumer on known permanent failures.
 	DLQFailureRetry DLQFailurePolicy = "retry"
 
 	// DLQFailureStop leaves the source offset unmarked and stops the consumer group with a terminal error.

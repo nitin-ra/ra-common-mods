@@ -24,7 +24,8 @@ func (e *permanentError) Unwrap() error {
 }
 
 // Permanent marks err as non-retryable so the consumer skips further handler retries
-// and immediately applies the subscription's failure disposition.
+// and immediately applies the subscription's failure disposition. A permanent
+// publication error under DLQFailureRetry stops the consumer.
 // Calling Permanent(nil) returns nil.
 func Permanent(err error) error {
 	if err == nil {
@@ -599,9 +600,22 @@ func (rt *retryRuntime) handleDLQ(
 				Attempts:      attempts,
 			}
 
-		case DLQFailureStop:
+		case DLQFailureStop, DLQFailureRetry:
+			category := "dlq_publish_failed"
+			logMessage := "DLQ publication failed; stopping consumer"
+			outcome := outcomeTerminalFailure.String()
+			retry := false
+			if policy.DLQFailurePolicy == DLQFailureRetry {
+				if permanentCategory := permanentDLQFailureCategory(dlqErr); permanentCategory != "" {
+					category = permanentCategory
+				} else {
+					logMessage = "DLQ publication failed; will retry DLQ transfer"
+					outcome = "retrying"
+					retry = true
+				}
+			}
 			if rt.logger != nil {
-				rt.logger.Error("DLQ publication failed; stopping consumer per policy",
+				rt.logger.Error(logMessage,
 					"group_id", rt.groupID,
 					"client_id", rt.clientID,
 					"topic", msg.Topic,
@@ -609,29 +623,22 @@ func (rt *retryRuntime) handleDLQ(
 					"partition", msg.Partition,
 					"offset", msg.Offset,
 					"attempt", attempts,
-					"outcome", outcomeTerminalFailure.String(),
-					"failure_category", "dlq_publish_failed",
+					"dlq_attempt", dlqAttempt,
+					"outcome", outcome,
+					"failure_category", category,
 				)
+			}
+			if retry {
+				continue
 			}
 			return processingResult{
-				Outcome:  outcomeTerminalFailure,
-				Err:      &dlqPublishError{err: fmt.Errorf("message retries exhausted (%w) and DLQ publish to %s failed: %w", handlerErr, policy.DLQTopic, dlqErr)},
+				Outcome: outcomeTerminalFailure,
+				Err: &dlqPublishError{
+					err:      fmt.Errorf("message retries exhausted (%w) and DLQ publish to %s failed: %w", handlerErr, policy.DLQTopic, dlqErr),
+					category: category,
+				},
 				Attempts: attempts,
 			}
-
-		case DLQFailureRetry:
-			if rt.logger != nil {
-				rt.logger.Error("DLQ publication failed; will retry DLQ transfer",
-					"group_id", rt.groupID,
-					"client_id", rt.clientID,
-					"topic", msg.Topic,
-					"dlq_topic", policy.DLQTopic,
-					"partition", msg.Partition,
-					"offset", msg.Offset,
-					"failure_category", "dlq_publish_failed",
-				)
-			}
-			continue
 
 		default:
 			return processingResult{

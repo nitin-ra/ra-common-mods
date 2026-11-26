@@ -1,7 +1,9 @@
 package kafka
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +11,7 @@ import (
 	"net"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1175,6 +1178,99 @@ func TestConsumerCloseDuringStalledSyncCommit(t *testing.T) {
 	}
 }
 
+func TestReconnectBackoffWaitsForSessionReadiness(t *testing.T) {
+	const healthy, zeroAssignment = 8, 10
+	const cancelAt = 11
+	fg := newFakeConsumerGroup()
+	var attempts int
+	var backoffAttempts []int
+	var delays []time.Duration
+	backoffStarted := make(chan struct{})
+	fg.consumeFn = func(ctx context.Context, _ []string, handler sarama.ConsumerGroupHandler) error {
+		attempts++
+		if attempts > cancelAt {
+			return errors.New("rejoined without entering cancellable backoff")
+		}
+		claims := map[string][]int32{"orders": {0, 1}}
+		switch attempts {
+		case healthy:
+			claims["orders"] = []int32{0}
+		case zeroAssignment:
+			claims = nil
+		}
+		sessionCtx, cancelSession := context.WithCancel(ctx)
+		defer cancelSession()
+		session := newFakeSession(sessionCtx, claims)
+		if err := handler.Setup(session); err != nil {
+			return err
+		}
+		if len(claims) != 0 {
+			// Partition 0 enters ConsumeClaim. On failed sessions, Sarama never
+			// launches ConsumeClaim for partition 1 because its initialization failed.
+			claim := newFakeClaim("orders", 0)
+			close(claim.msgs)
+			if err := handler.ConsumeClaim(session, claim); err != nil {
+				return err
+			}
+		}
+		cancelSession()
+		return handler.Cleanup(session)
+	}
+	gc, err := NewConsumer(testBrokerConfig(), testConsumerConfig("reconnect"), discardLogger(), func(o *consumerOptions) {
+		o.consumerGroupFactory = func([]string, string, *sarama.Config) (consumerGroupClient, error) { return fg, nil }
+		o.jitterFn = func(d time.Duration) time.Duration { return d / 2 }
+		o.sleepFn = func(ctx context.Context, d time.Duration) error {
+			backoffAttempts = append(backoffAttempts, attempts)
+			delays = append(delays, d)
+			if attempts >= cancelAt {
+				close(backoffStarted)
+				return defaultSleep(ctx, time.Hour)
+			}
+			return nil
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := gc.Close(); err != nil {
+			t.Errorf("close reconnect consumer: %v", err)
+		}
+	}()
+	if err := gc.Subscribe(Subscription{
+		Topic: "orders", RetryPolicy: DefaultRetryPolicy(),
+		Handler: func(context.Context, *Message) error { return nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- gc.Run(ctx) }()
+	select {
+	case <-backoffStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("failed session did not enter reconnect backoff")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not cancel reconnect backoff")
+	}
+	if want := []int{1, 2, 3, 4, 5, 6, 7, 9, 11}; !slices.Equal(backoffAttempts, want) || attempts != cancelAt {
+		t.Fatalf("backoff after attempts %v, consumed %d sessions; want %v and %d sessions", backoffAttempts, attempts, want, cancelAt)
+	}
+	if want := []time.Duration{125 * time.Millisecond, 250 * time.Millisecond, 500 * time.Millisecond,
+		time.Second, 2 * time.Second, 2500 * time.Millisecond, 2500 * time.Millisecond,
+		125 * time.Millisecond, 125 * time.Millisecond}; !slices.Equal(delays, want) {
+		t.Fatalf("reconnect delays %v; want %v", delays, want)
+	}
+}
+
 func TestReadinessInvalidatesOnSessionCancellationBeforeCleanup(t *testing.T) {
 	gc, err := NewConsumer(testBrokerConfig(), testConsumerConfig("session-cancellation"), discardLogger())
 	if err != nil {
@@ -1253,6 +1349,151 @@ func TestReadinessInvalidatesOnSessionCancellationBeforeCleanup(t *testing.T) {
 	waitUnready()
 	if err := h.Cleanup(next); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDLQRetryStopsOnPermanentPublicationFailure(t *testing.T) {
+	const source, dlq = "orders", "orders-dlq"
+	const maxMessageBytes = 512
+	payload := make([]byte, 400)
+	handlerErr := errors.New("sensitive handler details")
+	customErr := fmt.Errorf("custom wrapper: %w", Permanent(errors.New("sensitive producer details")))
+	authErr := sarama.Wrap(sarama.ErrOutOfBrokers, sarama.ErrBrokerNotAvailable, sarama.ErrSASLAuthenticationFailed)
+	configurationErr := sarama.ConfigurationError("sensitive configuration details")
+	tlsErr := &tls.CertificateVerificationError{Err: errors.New("sensitive verification details")}
+	for _, tc := range []struct {
+		name       string
+		wire       bool
+		localLimit bool
+		publishErr error
+		diagnostic string
+	}{
+		{name: "headers exceed local limit", wire: true, localLimit: true, diagnostic: "dlq_configuration_error"},
+		{name: "broker rejects size", wire: true, publishErr: sarama.ErrMessageSizeTooLarge, diagnostic: "dlq_message_too_large"},
+		{name: "closed producer", wire: true, publishErr: ErrProducerClosed, diagnostic: "dlq_producer_closed"},
+		{name: "authorization", wire: true, publishErr: sarama.ErrTopicAuthorizationFailed, diagnostic: "dlq_authorization_failed"},
+		{name: "wrapped authentication", publishErr: authErr, diagnostic: "dlq_authentication_failed"},
+		{name: "TLS verification", publishErr: tlsErr, diagnostic: "dlq_tls_verification_failed"},
+		{name: "invalid topic", publishErr: sarama.ErrInvalidTopic, diagnostic: "dlq_invalid_topic"},
+		{name: "configuration", publishErr: configurationErr, diagnostic: "dlq_configuration_error"},
+		{name: "custom permanent", publishErr: customErr, diagnostic: "dlq_permanent_error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var producer Producer
+			var broker *sarama.MockBroker
+			if tc.wire {
+				broker = sarama.NewMockBroker(t, 1)
+				defer broker.Close()
+				produce := sarama.NewMockProduceResponse(t)
+				if code, ok := tc.publishErr.(sarama.KError); ok {
+					produce.SetError(dlq, 0, code)
+				}
+				broker.SetHandlerByMap(map[string]sarama.MockResponse{
+					"ApiVersionsRequest": mockApiVersionsWithSASL(t),
+					"MetadataRequest": sarama.NewMockMetadataResponse(t).SetBroker(broker.Addr(), broker.BrokerID()).
+						SetLeader(source, 0, broker.BrokerID()).SetLeader(dlq, 0, broker.BrokerID()),
+					"ProduceRequest": produce,
+				})
+				bc := testBrokerConfig()
+				bc.Brokers = []string{broker.Addr()}
+				pc := DefaultProducerConfig()
+				pc.Idempotent = false
+				pc.MaxRetries = 0
+				if tc.localLimit {
+					pc.MaxMessageBytes = maxMessageBytes
+				}
+				var err error
+				producer, err = NewProducer(bc, pc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := producer.Close(); err != nil {
+						t.Errorf("close DLQ producer: %v", err)
+					}
+				}()
+				if tc.publishErr == ErrProducerClosed {
+					if err := producer.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if tc.localLimit {
+					if err := producer.Publish(t.Context(), source, nil, payload); err != nil {
+						t.Fatalf("source record without DLQ headers should fit: %v", err)
+					}
+				}
+			} else {
+				producer = &mockDLQProducer{publishF: func(context.Context, string, []byte, []byte, []RecordHeader) error {
+					return tc.publishErr
+				}}
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			fg := newFakeConsumerGroup()
+			var session *fakeSession
+			fg.consumeFn = func(ctx context.Context, _ []string, h sarama.ConsumerGroupHandler) (err error) {
+				session, err = runFakeSession(ctx, h, newFakeClaim(source, 0,
+					&sarama.ConsumerMessage{Topic: source, Offset: 0, Value: payload},
+					&sarama.ConsumerMessage{Topic: source, Offset: 1},
+				))
+				return err
+			}
+			cfg := testConsumerConfig("dlq-permanent")
+			cfg.CommitMode = CommitSync
+			retries := 0
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, nil))
+			gc, err := NewConsumer(testBrokerConfig(), cfg, logger, func(o *consumerOptions) {
+				o.consumerGroupFactory = func([]string, string, *sarama.Config) (consumerGroupClient, error) { return fg, nil }
+				o.sleepFn = func(context.Context, time.Duration) error {
+					retries++
+					cancel()
+					return context.Canceled
+				}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := gc.Close(); err != nil {
+					t.Errorf("close DLQ consumer: %v", err)
+				}
+			}()
+			var handled []int64
+			if err := gc.Subscribe(Subscription{
+				Topic: source,
+				RetryPolicy: &RetryPolicy{Strategy: RetryStrategyDLQ, DLQTopic: dlq,
+					DLQProducer: producer, DLQFailurePolicy: DLQFailureRetry},
+				Handler: func(_ context.Context, msg *Message) error {
+					handled = append(handled, msg.Offset)
+					return handlerErr
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			err = gc.Run(ctx)
+			if retries != 0 || !errors.Is(err, handlerErr) {
+				t.Fatalf("expected terminal outcome with handler error and no retry, got %v and %d retries", err, retries)
+			}
+			if tc.localLimit {
+				var configErr sarama.ConfigurationError
+				if !errors.As(err, &configErr) {
+					t.Fatalf("missing local size configuration error in %v", err)
+				}
+			} else if !errors.Is(err, tc.publishErr) {
+				t.Fatalf("missing publication error %v in %v", tc.publishErr, err)
+			}
+			if marks, commits := session.snapshotMarks(); len(marks) != 0 || commits != 0 || !slices.Equal(handled, []int64{0}) {
+				t.Fatalf("unresolved partition advanced: marks=%v commits=%d handled=%v", marks, commits, handled)
+			}
+			if health := gc.Health(); health.LastError != "terminal: "+tc.diagnostic || health.State != ConsumerStateFailed {
+				t.Fatalf("unexpected terminal health: %+v", health)
+			}
+			if entries := logs.String(); !strings.Contains(entries, `"failure_category":"`+tc.diagnostic+`"`) || strings.Contains(entries, "sensitive") {
+				t.Fatalf("expected safe DLQ failure category %q in logs: %s", tc.diagnostic, entries)
+			}
+		})
 	}
 }
 

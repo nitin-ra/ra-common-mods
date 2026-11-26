@@ -624,6 +624,85 @@ func TestIT05_DLQFailDiscardAndStopOffsetSafety(t *testing.T) {
 	}
 }
 
+func TestIT05_DLQRetryStopsOnBrokerMessageSizeLimit(t *testing.T) {
+	brokers := integrationBrokers(t)
+	source := uniqueName("it05-size-source")
+	dlq := uniqueName("it05-size-dlq")
+	group := uniqueName("grp-it05-size")
+	createTestTopic(t, brokers, source, 1)
+	createTestTopic(t, brokers, dlq, 1)
+	admin, err := sarama.NewClusterAdmin(brokers, sarama.NewConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := admin.Close(); err != nil {
+			t.Errorf("close admin: %v", err)
+		}
+	}()
+	limit := "1024"
+	if err := admin.AlterConfig(sarama.TopicResource, dlq, map[string]*string{"max.message.bytes": &limit}, false); err != nil {
+		t.Fatalf("set DLQ topic message limit: %v", err)
+	}
+	producerCfg := kafka.DefaultProducerConfig()
+	producerCfg.Compression = "none"
+	producer, err := kafka.NewProducer(brokerCfgFor(brokers), producerCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := producer.Close(); err != nil {
+			t.Errorf("close producer: %v", err)
+		}
+	}()
+	for _, payload := range []string{"resolved", strings.Repeat("x", 2048), "must remain unread"} {
+		if err := producer.Publish(t.Context(), source, nil, []byte(payload)); err != nil {
+			t.Fatalf("publish source record: %v", err)
+		}
+	}
+	cfg := consumerCfgFor(group)
+	cfg.CommitMode = kafka.CommitSync
+	consumer, err := kafka.NewConsumer(brokerCfgFor(brokers), cfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := consumer.Close(); err != nil {
+			t.Errorf("close consumer: %v", err)
+		}
+	}()
+	handlerErr := errors.New("poison record")
+	var handled []int64
+	if err := consumer.Subscribe(kafka.Subscription{
+		Topic: source,
+		RetryPolicy: &kafka.RetryPolicy{Strategy: kafka.RetryStrategyDLQ, DLQTopic: dlq,
+			DLQProducer: producer, DLQFailurePolicy: kafka.DLQFailureRetry},
+		Handler: func(_ context.Context, msg *kafka.Message) error {
+			handled = append(handled, msg.Offset)
+			if msg.Offset == 1 {
+				return handlerErr
+			}
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	if err := consumer.Run(ctx); !errors.Is(err, handlerErr) || !errors.Is(err, sarama.ErrMessageSizeTooLarge) {
+		t.Fatalf("expected handler failure and broker message-size rejection, got %v", err)
+	}
+	if !slices.Equal(handled, []int64{0, 1}) {
+		t.Fatalf("handled offsets %v; want resolved offset 0 and poison offset 1", handled)
+	}
+	if offset, ok := committedOffset(t, brokers, group, source, 0); !ok || offset != 1 {
+		t.Fatalf("committed offset = %d, present = %t; want 1 with the poison record unresolved", offset, ok)
+	}
+	if health := consumer.Health(); health.State != kafka.ConsumerStateFailed || health.LastError != "terminal: dlq_message_too_large" {
+		t.Fatalf("unexpected terminal health %+v", health)
+	}
+}
+
 func TestIT06_DLQRetryBlocksAffectedPartitionUntilRecovered(t *testing.T) {
 	brokers := integrationBrokers(t)
 	srcTopic := uniqueName("it06-src")

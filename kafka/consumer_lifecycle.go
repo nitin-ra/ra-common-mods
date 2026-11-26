@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -312,7 +313,8 @@ func (e *handlerPanicError) Unwrap() error {
 }
 
 type dlqPublishError struct {
-	err error
+	err      error
+	category string
 }
 
 func (e *dlqPublishError) Error() string {
@@ -323,17 +325,49 @@ func (e *dlqPublishError) Unwrap() error {
 	return e.err
 }
 
+func permanentDLQFailureCategory(err error) string {
+	// A broker lookup can join errors from multiple brokers. Check each known
+	// protocol code through the chain instead of taking the first Kafka error.
+	switch {
+	case errors.Is(err, ErrProducerClosed), errors.Is(err, sarama.ErrShuttingDown), errors.Is(err, sarama.ErrClosedClient):
+		return "dlq_producer_closed"
+	case errors.Is(err, sarama.ErrMessageSizeTooLarge), errors.Is(err, sarama.ErrMessageSetSizeTooLarge):
+		return "dlq_message_too_large"
+	case errors.Is(err, sarama.ErrTopicAuthorizationFailed), errors.Is(err, sarama.ErrGroupAuthorizationFailed),
+		errors.Is(err, sarama.ErrClusterAuthorizationFailed), errors.Is(err, sarama.ErrTransactionalIDAuthorizationFailed),
+		errors.Is(err, sarama.ErrDelegationTokenAuthorizationFailed):
+		return "dlq_authorization_failed"
+	case errors.Is(err, sarama.ErrSASLAuthenticationFailed), errors.Is(err, sarama.ErrUnsupportedSASLMechanism),
+		errors.Is(err, sarama.ErrIllegalSASLState):
+		return "dlq_authentication_failed"
+	case errors.Is(err, sarama.ErrInvalidTopic):
+		return "dlq_invalid_topic"
+	}
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return "dlq_tls_verification_failed"
+	}
+	var cfgErr sarama.ConfigurationError
+	if errors.As(err, &cfgErr) || errors.Is(err, sarama.ErrInvalidConfig) {
+		return "dlq_configuration_error"
+	}
+	if isPermanentError(err) {
+		return "dlq_permanent_error"
+	}
+	return ""
+}
+
 func classifyFailureCategory(err error) string {
 	if err == nil {
 		return "none"
 	}
+	var de *dlqPublishError
+	if errors.As(err, &de) {
+		return de.category
+	}
 	var pe *handlerPanicError
 	if errors.As(err, &pe) {
 		return "handler_panic"
-	}
-	var de *dlqPublishError
-	if errors.As(err, &de) {
-		return "dlq_publish_failed"
 	}
 	var provider SafeErrorCodeProvider
 	if errors.As(err, &provider) {
@@ -378,13 +412,13 @@ func safeConsumerDiagnosticForConsumer(err error, resetInvalidOffsets bool) stri
 }
 
 func formatConsumerDiagnostic(err error, class string) string {
+	var de *dlqPublishError
+	if errors.As(err, &de) {
+		return class + ": " + de.category
+	}
 	var pe *handlerPanicError
 	if errors.As(err, &pe) {
 		return class + ": handler_panic"
-	}
-	var de *dlqPublishError
-	if errors.As(err, &de) {
-		return class + ": dlq_publish_failed"
 	}
 	var provider SafeErrorCodeProvider
 	if errors.As(err, &provider) {

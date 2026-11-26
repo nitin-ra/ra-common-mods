@@ -40,6 +40,7 @@ type consumer struct {
 	ready             bool
 	assignedClaims    int
 	activeSessionSeq  uint64
+	readySessionSeq   uint64
 	expectedClaims    map[topicPartitionKey]struct{}
 	initializedClaims map[topicPartitionKey]struct{}
 	lastError         string
@@ -411,13 +412,17 @@ func (c *consumer) consumeLoop(
 			return
 		}
 
-		handler.resetSessionFlag()
+		handler.currentSessionSeq.Store(0)
 		err := client.Consume(internalCtx, topics, handler)
 
 		if internalCtx.Err() != nil || c.isStopRequested() {
 			return
 		}
 
+		initialized := handler.sessionReachedReadiness()
+		if initialized {
+			reconnectDelay = defaultReconnectInitialDelay
+		}
 		if err != nil {
 			c.recordError(err, false)
 			resetInvalid := c.consumerCfg.ResetInvalidOffsets
@@ -437,21 +442,11 @@ func (c *consumer) consumeLoop(
 				c.signalTerminalFailure(formatConsumerError("terminal consumer error", err))
 				return
 			}
-
-			wait := rt.jitter(reconnectDelay)
-			if sleepErr := rt.sleep(internalCtx, wait); sleepErr != nil {
-				return
-			}
-			reconnectDelay = nextBackoffDelay(reconnectDelay, defaultReconnectMaxDelay, 2.0)
+		} else if initialized {
 			continue
 		}
 
-		if handler.wasSessionEstablished() {
-			reconnectDelay = defaultReconnectInitialDelay
-			continue
-		}
-
-		// Avoid a hot spin loop if Consume returns nil repeatedly without establishing a session.
+		// Sarama can return nil after Setup when a claim failed to initialize.
 		wait := rt.jitter(reconnectDelay)
 		if sleepErr := rt.sleep(internalCtx, wait); sleepErr != nil {
 			return
@@ -760,23 +755,20 @@ type consumerGroupHandler struct {
 	stopCh     <-chan struct{}
 	commitMode CommitMode
 
-	sessionEstablished atomic.Bool
 	currentSessionSeq  atomic.Uint64
 	stopSessionWatcher func()
 	commitMu           sync.Mutex
 	hasMarked          atomic.Bool
 }
 
-func (h *consumerGroupHandler) resetSessionFlag() {
-	h.sessionEstablished.Store(false)
-}
-
-func (h *consumerGroupHandler) wasSessionEstablished() bool {
-	return h.sessionEstablished.Load()
+func (h *consumerGroupHandler) sessionReachedReadiness() bool {
+	seq := h.currentSessionSeq.Load()
+	h.consumer.mu.Lock()
+	defer h.consumer.mu.Unlock()
+	return seq != 0 && seq == h.consumer.readySessionSeq
 }
 
 func (h *consumerGroupHandler) Setup(session sarama.ConsumerGroupSession) error {
-	h.sessionEstablished.Store(true)
 	h.hasMarked.Store(false)
 
 	expected := make(map[topicPartitionKey]struct{})
@@ -834,6 +826,7 @@ func (c *consumer) setupSessionClaims(ctx context.Context, expected map[topicPar
 
 	if len(expected) == 0 && canBeReady && ctx.Err() == nil {
 		c.ready = true
+		c.readySessionSeq = seq
 		c.state = ConsumerStateRunning
 	} else {
 		c.ready = false
@@ -868,6 +861,7 @@ func (c *consumer) markClaimInitialized(ctx context.Context, seq uint64, topic s
 	if canBeReady && len(c.initializedClaims) >= len(c.expectedClaims) {
 		if !c.ready || c.state != ConsumerStateRunning {
 			c.ready = true
+			c.readySessionSeq = seq
 			c.state = ConsumerStateRunning
 			becameReady = true
 		}
